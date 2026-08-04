@@ -50,33 +50,78 @@ internal static class DeterministicLayout<T> where T : struct
         System.Runtime.CompilerServices.RuntimeHelpers.IsReferenceOrContainsReferences<T>();
 
     /// <summary>Number of deterministic scalars a value of <typeparamref name="T"/> reduces to.</summary>
-    internal static readonly int LeafCount;
+    /// <exception cref="NotSupportedException"><typeparamref name="T"/> holds a non-entity reference.</exception>
+    internal static int LeafCount {
+        get {
+            AssertSupported();
+            return leafCount;
+        }
+    }
+
+    private static readonly int leafCount;
 
     private static readonly Func<T, ulong>  hash;
     private static readonly WriteLeaves<T>  write;
     private static readonly ReadLeaves<T>   read;
+
+    /// <summary>
+    /// Why <typeparamref name="T"/> cannot be used in a deterministic simulation, or null when it can.
+    /// </summary>
+    /// <remarks>
+    /// The failure is recorded rather than thrown from the static constructor: a throwing cctor
+    /// surfaces as <see cref="TypeInitializationException"/> with the real explanation buried in
+    /// an inner exception, and every later use of the type reports the same wrapper. Storing it
+    /// lets each entry point throw the actionable message directly.
+    /// </remarks>
+    private static readonly NotSupportedException unsupported;
 
     static DeterministicLayout()
     {
         if (!HasReferences) {
             return;     // fast path: raw bytes are used instead, no plan needed
         }
-        var plan  = DeterministicLayoutBuilder.BuildPlan(typeof(T));
-        LeafCount = plan.Count;
+        List<DeterministicLeaf> plan;
+        try {
+            plan = DeterministicLayoutBuilder.BuildPlan(typeof(T));
+        }
+        catch (NotSupportedException exception) {
+            unsupported = exception;
+            return;
+        }
+        leafCount = plan.Count;
         hash      = DeterministicLayoutBuilder.CompileHash<T>(plan);
         write     = DeterministicLayoutBuilder.CompileWrite<T>(plan);
         read      = DeterministicLayoutBuilder.CompileRead<T>(plan);
     }
 
+    /// <exception cref="NotSupportedException"><typeparamref name="T"/> holds a non-entity reference.</exception>
+    private static void AssertSupported()
+    {
+        if (unsupported != null) {
+            throw new NotSupportedException(unsupported.Message, unsupported);
+        }
+    }
+
     /// <summary>Deterministic hash of <paramref name="value"/>.</summary>
-    internal static ulong Hash(in T value) => hash(value);
+    internal static ulong Hash(in T value)
+    {
+        AssertSupported();
+        return hash(value);
+    }
 
     /// <summary>Write the leaves of <paramref name="value"/>.</summary>
-    internal static void Write(in T value, ulong[] dst, int offset) => write(value, dst, offset);
+    internal static void Write(in T value, ulong[] dst, int offset)
+    {
+        AssertSupported();
+        write(value, dst, offset);
+    }
 
     /// <summary>Restore <paramref name="value"/>, binding entities to <paramref name="store"/>.</summary>
     internal static void Read(ref T value, ulong[] src, int offset, EntityStore store)
-        => read(ref value, src, offset, store);
+    {
+        AssertSupported();
+        read(ref value, src, offset, store);
+    }
 }
 
 /// <summary>A single deterministic scalar reached by a chain of fields from the component root.</summary>
