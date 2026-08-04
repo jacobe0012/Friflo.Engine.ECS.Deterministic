@@ -105,6 +105,11 @@ public sealed class FrifloKlothoServer : IDisposable
         }
         var server = new FrifloKlothoServer(store, simConfig, sessionConfig, callbacks, registerCommands, logger);
         server.networkService.Initialize(transport, server.commandFactory, logger);
+        // The spectator cap is a property on the service rather than something it reads out of the
+        // session config, so it stays at its default of zero - rejecting every spectator - unless
+        // something assigns it. RoomManager is what normally does, and this class replaces
+        // RoomManager. Taking it from the session config keeps the two limits in one place.
+        server.networkService.MaxSpectatorsPerRoom = sessionConfig.MaxSpectators;
         server.InitializeEngine();
         server.networkService.CreateRoom(roomName, sessionConfig.MaxPlayers);
         return server;
