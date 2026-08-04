@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using Friflo.Engine.ECS;
 using Friflo.Engine.ECS.Systems;
 using xpTURN.Klotho.Core;
@@ -150,6 +151,10 @@ public sealed class FrifloKlothoClient : IDisposable
     /// </param>
     /// <param name="address">Server address.</param>
     /// <param name="port">Server port.</param>
+    /// <param name="roomId">
+    /// Which room to join on a server hosting several (<see cref="FrifloKlothoRoomServer"/>), or -1
+    /// for a single-room server.
+    /// </param>
     /// <param name="logger">Optional logger.</param>
     public static FrifloKlothoClient Connect(
         EntityStore                store,
@@ -160,6 +165,7 @@ public sealed class FrifloKlothoClient : IDisposable
         Action<CommandFactory>     registerCommands = null,
         string                     address          = "loopback",
         int                        port             = 0,
+        int                        roomId           = -1,
         IKLogger                   logger           = null)
     {
         if (store     == null) throw new ArgumentNullException(nameof(store));
@@ -174,10 +180,11 @@ public sealed class FrifloKlothoClient : IDisposable
         var client = new FrifloKlothoClient(store, simConfig, sessionConfig, callbacks, registerCommands, logger);
         client.networkService.Initialize(transport, client.commandFactory, logger);
         client.InitializeEngine();
-        // No room id: a single-room server has no RoomRouter in front of it, so no
-        // RoomHandshakeMessage prefix is expected. JoinRoom(null) leaves _roomId at -1, which is
-        // what suppresses that prefix in SendFirstMessage.
-        client.networkService.JoinRoom(null);
+        // The room id travels as a RoomHandshakeMessage prefixed to the first message, which is how
+        // a RoomRouter decides where the peer belongs. A negative id leaves the service's _roomId at
+        // -1 and suppresses that prefix - correct for a single-room server, which has no router in
+        // front of it and would reject the prefix as a malformed first message.
+        client.networkService.JoinRoom(roomId >= 0 ? roomId.ToString(CultureInfo.InvariantCulture) : null);
         client.networkService.Connect(address, port);
         return client;
     }
