@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFrameworks>net8.0;net472</TargetFrameworks>
+    <LangVersion>latest</LangVersion>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Nullable>disable</Nullable>
+    <AssemblyName>PhysicsDeterminismProbe</AssemblyName>
+    <RootNamespace>xpTURN.Klotho.PhysicsDeterminismProbe</RootNamespace>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <AutoGenerateBindingRedirects>true</AutoGenerateBindingRedirects>
+  </PropertyGroup>
+
+  <!-- Span<T> on net472 (Unity Mono) -->
+  <ItemGroup Condition="'$(TargetFramework)' == 'net472'">
+    <PackageReference Include="System.Memory" Version="4.5.5" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <RuntimeRoot>..\..\com.xpturn.klotho\Runtime</RuntimeRoot>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Program.cs" />
+    <Compile Include="HashCodePolyfill.cs" />
+    <Compile Include="Stubs.cs" />
+    <Compile Include="$(RuntimeRoot)\Deterministic\Math\*.cs" Link="Math\%(Filename)%(Extension)" />
+    <Compile Include="$(RuntimeRoot)\Deterministic\Geometry\*.cs" Link="Geometry\%(Filename)%(Extension)" />
+    <Compile Include="$(RuntimeRoot)\Deterministic\Physics\*.cs"
+             Exclude="$(RuntimeRoot)\Deterministic\Physics\FPStaticColliderSerializer.cs"
+             Link="Physics\%(Filename)%(Extension)" />
+    <Compile Include="$(RuntimeRoot)\Deterministic\FPHash.cs" Link="FPHash.cs" />
+    <Compile Include="$(RuntimeRoot)\Core\Attributes\PrimitiveAttribute.cs" Link="PrimitiveAttribute.cs" />
+    <Compile Include="$(RuntimeRoot)\Core\ICommand.cs" Link="ICommand.cs" />
+    <Compile Include="$(RuntimeRoot)\Core\Pool\ListPool.cs" Link="ListPool.cs" />
+  </ItemGroup>
+</Project>

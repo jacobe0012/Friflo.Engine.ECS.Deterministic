@@ -1,0 +1,666 @@
+using System;
+using xpTURN.Klotho.Logging;
+using xpTURN.Klotho.ECS;
+using xpTURN.Klotho.Network;
+
+namespace xpTURN.Klotho.Core
+{
+    /// <summary>
+    /// Source path that invoked ApplyExtraDelay. Used to distinguish the entry context in logs and
+    /// to let consumers branch on the path (e.g., metrics tagging).
+    /// </summary>
+    public enum ExtraDelaySource
+    {
+        /// <summary>Normal-join handshake completion (SyncCompleteMessage).</summary>
+        Sync,
+        /// <summary>Late-join handshake completion (LateJoinAcceptMessage).</summary>
+        LateJoin,
+        /// <summary>Reconnect handshake completion (ReconnectAcceptMessage).</summary>
+        Reconnect,
+        /// <summary>Mid-match server-push update (RecommendedExtraDelayUpdateMessage).</summary>
+        DynamicPush,
+    }
+
+    /// <summary>
+    /// Klotho engine state.
+    /// </summary>
+    public enum KlothoState
+    {
+        /// <summary>
+        /// Initial state after construction. Initialize has not yet run.
+        /// </summary>
+        Idle,
+        /// <summary>
+        /// Initialize completed; waiting for the network layer to issue OnGameStart (Start to be called).
+        /// </summary>
+        WaitingForPlayers,
+        /// <summary>
+        /// SD-server only: awaiting all players' bootstrap-ready acks (or timeout) before first tick.
+        /// Blocks UpdateServerTick via the existing State == Running gate.
+        /// </summary>
+        BootstrapPending,
+        /// <summary>
+        /// Active simulation. Update advances ticks each frame and dispatches events.
+        /// </summary>
+        Running,
+        /// <summary>
+        /// Lockstep client (prediction OFF) only: a player's input is missing for the current tick — halt and wait.
+        /// Returns to Running automatically once CanAdvanceTick() succeeds. Replay seek also uses this transiently.
+        /// </summary>
+        Paused,
+        /// <summary>
+        /// Transient: tick advance frozen while transport keepalives continue. ExecuteTick is blocked
+        /// while in Ending. NOT included in IsEnded() — still pre-terminal, allowing AbortMatch to
+        /// transition Ending → Aborted. Currently not entered in the normal end flow (both
+        /// EndGracePolicy.Continue and EndGracePolicy.Pause keep Running through the grace window);
+        /// retained for API stability and potential future use.
+        /// </summary>
+        Ending,
+        /// <summary>
+        /// Stop() invoked — engine has been torn down. Replay playback also lands here when finished.
+        /// </summary>
+        Finished,
+        /// <summary>
+        /// Match was aborted before completion (chain stall timeout, catastrophic divergence, etc.).
+        /// Distinct from Finished so replay save / score aggregation / "normal end" UI paths can branch.
+        /// Pair an AbortReason via the OnMatchAborted event for user-facing context.
+        /// </summary>
+        Aborted
+    }
+
+    /// <summary>
+    /// Helpers for KlothoState.
+    /// </summary>
+    public static class KlothoStateExtensions
+    {
+        /// <summary>
+        /// True if the engine has reached a terminal state (Finished normally or Aborted).
+        /// Prefer over `== Finished` so abort paths are not silently treated as normal end.
+        /// </summary>
+        public static bool IsEnded(this KlothoState state)
+            => state == KlothoState.Finished || state == KlothoState.Aborted;
+    }
+
+    /// <summary>
+    /// Category of a pending entry wiped during cleanup before the chain advanced past it.
+    /// Emitted via IKlothoEngine.OnPendingWipe.
+    /// </summary>
+    public enum WipeKind
+    {
+        /// <summary>A player input command was wiped (playerId ≥ 0).</summary>
+        Input,
+        /// <summary>A Synced simulation event was wiped (playerId = -1).</summary>
+        SyncedEvent,
+    }
+
+    /// <summary>
+    /// Reason an in-progress match was aborted. Emitted via IKlothoEngine.OnMatchAborted.
+    /// </summary>
+    public enum AbortReason
+    {
+        /// <summary>Unspecified / generic abort.</summary>
+        Unknown,
+        /// <summary>Chain advance stalled past the watchdog threshold.</summary>
+        ChainStallTimeout,
+        /// <summary>State hash divergence that corrective reset could not recover.</summary>
+        StateDivergence,
+        /// <summary>Reconnect attempt exhausted retries or timed out.</summary>
+        ReconnectFailed,
+    }
+
+    /// <summary>
+    /// Reason an in-progress match was corrective-reset (state restored, match continues).
+    /// Emitted via IKlothoEngine.OnMatchReset. Sibling to AbortReason — abort ends the match,
+    /// reset rewinds state and resumes.
+    /// </summary>
+    public enum ResetReason
+    {
+        /// <summary>Unspecified / generic reset.</summary>
+        Unknown,
+        /// <summary>Hash divergence recovered by FullState rebroadcast.</summary>
+        StateDivergence,
+        /// <summary>Manual / operator-triggered resync (debug / admin tool).</summary>
+        ManualResync,
+    }
+
+    /// <summary>
+    /// Source path that invoked ApplyFullState. Controls retreat policy and side-effect cascade.
+    /// </summary>
+    public enum ApplyReason
+    {
+        /// <summary>P2P late-join or SD late-join FullState apply.</summary>
+        LateJoin,
+        /// <summary>SD session-start initial FullState broadcast.</summary>
+        InitialFullState,
+        /// <summary>Unicast resync response to RequestFullStateResync.</summary>
+        ResyncRequest,
+        /// <summary>Host-broadcast corrective reset on hash divergence.</summary>
+        CorrectiveReset,
+        /// <summary>Reconnect FullState apply.</summary>
+        Reconnect,
+    }
+
+    /// <summary>
+    /// Frame verification state.
+    /// </summary>
+    public enum FrameState
+    {
+        /// <summary>A tick that ran with one or more predicted inputs.</summary>
+        Predicted,
+        /// <summary>A tick where all player inputs are confirmed and every prior tick has been verified.</summary>
+        Verified
+    }
+
+    /// <summary>
+    /// Simulation stage. Distinguishes Forward/Resimulate so that some logic can be bypassed during the resimulation window.
+    /// </summary>
+    public enum SimulationStage
+    {
+        /// <summary>Forward simulation (including prediction). Default.</summary>
+        Forward,
+        /// <summary>The verified/predicted resimulation window immediately after a rollback.</summary>
+        Resimulate
+    }
+
+    /// <summary>
+    /// Klotho main engine interface. Manages network synchronization and simulation execution.
+    /// </summary>
+    public interface IKlothoEngine
+    {
+        /// <summary>
+        /// Simulation engine parameters. Immutable for the duration of the session.
+        /// </summary>
+        ISimulationConfig SimulationConfig { get; }
+
+        /// <summary>
+        /// Per-session mutable configuration.
+        /// </summary>
+        ISessionConfig SessionConfig { get; }
+
+        KlothoState State { get; }
+
+        /// <summary>
+        /// The simulation instance managed by this engine.
+        /// </summary>
+        ISimulation Simulation { get; }
+
+        /// <summary>
+        /// Logger.
+        /// </summary>
+        IKLogger Logger { get; }
+
+        /// <summary>
+        /// Current tick number.
+        /// </summary>
+        int CurrentTick { get; }
+
+        /// <summary>
+        /// Local player ID.
+        /// </summary>
+        int LocalPlayerId { get; }
+
+        /// <summary>
+        /// Time per tick (milliseconds).
+        /// </summary>
+        int TickInterval { get; }
+
+        /// <summary>
+        /// Input delay tick count. Local input is scheduled this many ticks ahead to compensate for network latency.
+        /// </summary>
+        int InputDelay { get; }
+
+        /// <summary>
+        /// Server-recommended extra InputDelay ticks currently applied (LateJoin/Reconnect catchup-gap compensation
+        /// plus mid-match dynamic adjustments). Read by transport layer to size LateJoin prefill range so the guest's
+        /// own input chain has empty cmds covering [currentTick, currentTick + InputDelay + RecommendedExtraDelay).
+        /// </summary>
+        int RecommendedExtraDelay { get; }
+
+        /// <summary>
+        /// Random seed used for the session. A network-agreed value used by OnInitializeWorld for deterministic initialization.
+        /// </summary>
+        int RandomSeed { get; }
+
+        /// <summary>
+        /// Whether the engine is currently in replay playback mode.
+        /// View callbacks and game code use this to guard live-only behavior (e.g. command sending).
+        /// </summary>
+        bool IsReplayMode { get; }
+
+        /// <summary>
+        /// Whether the engine is currently acting as the server in ServerDriven mode.
+        /// True only on the SD server; P2P peers, SD Client, Replay, and Spectator are all false.
+        /// </summary>
+        bool IsServer { get; }
+
+        /// <summary>
+        /// Whether the engine is currently acting as the host in P2P mode.
+        /// True only on the P2P host; P2P guests, SD server/client, Replay, and Spectator are all false.
+        /// Orthogonal to IsServer (SD-specific): a P2P host has IsServer=false.
+        /// </summary>
+        bool IsHost { get; }
+
+        /// <summary>
+        /// Current simulation stage.
+        /// Forward = forward tick, Resimulate = the resimulation window immediately after a rollback.
+        /// Set to Resimulate upon entering the resimulation window and reverts to Forward immediately after returning.
+        /// </summary>
+        SimulationStage Stage { get; }
+
+        /// <summary>Convenience property for forward simulation. `Stage == Forward`.</summary>
+        bool IsForward => Stage == SimulationStage.Forward;
+
+        /// <summary>Convenience property for resimulation. `Stage == Resimulate`.</summary>
+        bool IsResimulation => Stage == SimulationStage.Resimulate;
+
+        /// <summary>
+        /// Whether OnMatchEnded has been dispatched on this engine (the verified IMatchEndEvent fired).
+        /// Exposed for game-side hooks (UI / audio / Continue-policy input filtering) — Pause grace's
+        /// StopCommand emission is handled inside the engine OnPollInput dispatch site.
+        /// </summary>
+        bool IsMatchEnded { get; }
+
+        /// <summary>
+        /// Initialize the engine.
+        /// </summary>
+        void Initialize(ISimulation simulation, IKlothoNetworkService networkService, IKLogger logger);
+
+        /// <summary>
+        /// Initialize the engine with callbacks.
+        /// simulationCallbacks are deterministic callbacks invoked on all peers,
+        /// viewCallbacks are client-only view callbacks (null is allowed).
+        /// </summary>
+        void Initialize(ISimulation simulation, IKlothoNetworkService networkService, IKLogger logger,
+            ISimulationCallbacks simulationCallbacks, IViewCallbacks viewCallbacks = null);
+
+
+        /// <summary>
+        /// Start the game.
+        /// </summary>
+        void Start();
+
+        /// <summary>
+        /// Per-frame update. Advances ticks, prediction, and resimulation based on accumulated time.
+        /// </summary>
+        void Update(float deltaTime);
+
+        /// <summary>
+        /// Adds a local command to the input buffer and sends it over the network.
+        /// extraDelay shifts cmd.Tick further into the future on top of InputDelayTicks.
+        /// Used by recovery paths (e.g. LateJoin spawn cmd PastTick reject loop) to add lead margin
+        /// for specific commands without changing the global InputDelayTicks.
+        /// </summary>
+        void InputCommand(ICommand command, int extraDelay = 0);
+
+        /// <summary>
+        /// Issues a command with reliability — the framework retries on the configured cadence,
+        /// escalates per-cmd lead margin on PastTick reject (capped at <see cref="ReliabilityPolicy.ExtraDelayMax"/>),
+        /// and resolves on either the caller's <see cref="IReliableCommandHandle.Confirm"/> (state-driven ack)
+        /// or a wire-level ack interpretation (<see cref="ReliabilityPolicy.TreatDuplicateAsAck"/>).
+        /// Use for commit-exactly-once commands (e.g. character spawn) whose ack is observable in the
+        /// simulation frame.
+        /// <para>
+        /// <paramref name="commandFactory"/> is invoked once per send (initial + retries). The factory
+        /// should acquire a fresh instance from <c>CommandPool</c> and populate its payload from
+        /// current engine state — retries pick up newer state (e.g. PlayerConfig arrived after the first
+        /// attempt). Use a bound method group rather than a lambda capturing locals to avoid per-call GC.
+        /// The framework takes ownership of each returned instance; the caller must not return it to
+        /// the pool. The factory must return the same <see cref="ICommand.CommandTypeId"/> on every
+        /// invocation — used to filter wire reject events.
+        /// </para>
+        /// </summary>
+        IReliableCommandHandle IssueOnce(Func<ICommand> commandFactory, ReliabilityPolicy policy = null);
+
+        /// <summary>
+        /// Applies the server-recommended extra InputDelay (absolute value) used to compensate the
+        /// LateJoin/Reconnect catchup gap and mid-match RTT shifts. Called from accept-message handlers
+        /// and from periodic server push updates. `source` selects the log tag and metric path.
+        /// </summary>
+        void ApplyExtraDelay(int delay, ExtraDelaySource source);
+
+        /// <summary>
+        /// Client-reactive escalation: bumps the recommended extra InputDelay by `step` (capped at `max`)
+        /// only when the new value is strictly greater than the current value. Used by client-reactive
+        /// fallback when server push is delayed/missed and the client observes repeated PastTick rejects.
+        /// </summary>
+        void EscalateExtraDelay(int step, int max);
+
+        /// <summary>
+        /// Client-reactive de-escalation: decays the reactive extra-delay correction by `step` toward 0
+        /// during stable intervals (no recent PastTick/rollback-burst). Server-pushed baseline is
+        /// untouched. No-op when the reactive component is already 0.
+        /// </summary>
+        void DeEscalateExtraDelay(int step);
+
+        /// <summary>
+        /// Fired after ApplyExtraDelay/EscalateExtraDelay/DeEscalateExtraDelay updates the recommended
+        /// extra delay (effective, clamped value).
+        /// Used by the client-reactive fallback to track the last server-push tick (engine-tick grace window).
+        /// </summary>
+        event Action<int> OnExtraDelayChanged;
+
+        /// <summary>
+        /// Fired when the verified-chain advance stalls because at least one player's command is missing
+        /// for the next tick. Production-active (fires regardless of build flags); the dev-only log path
+        /// is separate and throttled. Used by game-side reactive fallback to count chain-break bursts.
+        /// </summary>
+        event Action OnChainAdvanceBreak;
+
+        /// <summary>
+        /// Stops the engine and unsubscribes from events.
+        /// </summary>
+        void Stop();
+
+        /// <summary>
+        /// Tick execution complete event (executedTick).
+        /// </summary>
+        event Action<int> OnTickExecuted;
+
+        /// <summary>
+        /// Desync detected event (localHash, remoteHash).
+        /// </summary>
+        event Action<long, long> OnDesyncDetected;
+
+        /// <summary>
+        /// Raised when an ApplyFullState pass observes localHash != remoteHash (tick, localHash, remoteHash).
+        /// Sample / telemetry layer can trend mismatches; an upcoming corrective-reset path may use this
+        /// as the trigger for KlothoState recovery via FullState rebroadcast.
+        /// </summary>
+        event Action<int, long, long> OnHashMismatch;
+
+        /// <summary>
+        /// Rollback executed event (fromTick, toTick).
+        /// </summary>
+        event Action<int, int> OnRollbackExecuted;
+
+        /// <summary>
+        /// Rollback failed event (requestedTick, reason).
+        /// </summary>
+        event Action<int, string> OnRollbackFailed;
+
+        /// <summary>
+        /// The last contiguous verified tick. -1 if nothing has been verified.
+        /// </summary>
+        int LastVerifiedTick { get; }
+
+        /// <summary>
+        /// Checks whether the specified tick is in the verified state.
+        /// </summary>
+        bool IsFrameVerified(int tick);
+
+        /// <summary>
+        /// Returns the frame state (Predicted/Verified) of the specified tick.
+        /// </summary>
+        FrameState GetFrameState(int tick);
+
+        /// <summary>
+        /// Raised when a tick transitions from Predicted to Verified (tick).
+        /// </summary>
+        event Action<int> OnFrameVerified;
+
+        /// <summary>
+        /// Tick execution event that also delivers the frame state (tick, state).
+        /// </summary>
+        event Action<int, FrameState> OnTickExecutedWithState;
+
+        /// <summary>
+        /// Regular event raised on a predicted tick (tick, event).
+        /// </summary>
+        event Action<int, SimulationEvent> OnEventPredicted;
+
+        /// <summary>
+        /// Predicted event confirmed as-is by the verification result (tick, event).
+        /// </summary>
+        event Action<int, SimulationEvent> OnEventConfirmed;
+
+        /// <summary>
+        /// Predicted event canceled by rollback (tick, event).
+        /// </summary>
+        event Action<int, SimulationEvent> OnEventCanceled;
+
+        /// <summary>
+        /// Synced event dispatched only on verified ticks (tick, event).
+        /// </summary>
+        event Action<int, SimulationEvent> OnSyncedEvent;
+
+        /// <summary>
+        /// The Synced event set changed under desync-recovery re-simulation at a tick that was
+        /// already dispatched (tick, event, kind). The exactly-once invariant blocks (re-)dispatch
+        /// at or below the watermark, so this is the only signal that irreversible work ran on
+        /// diverged state — the engine cannot revert external side effects (reported scores etc.);
+        /// the game owns the response (reconcile, or AbortMatch for unrecoverable books).
+        /// Removed payloads are pooled old events valid ONLY during the callback (same contract as
+        /// OnEventCanceled). Exception: an Added IMatchEndEvent with no prior OnMatchEnded fires
+        /// OnMatchEnded normally (guard flag keeps exactly-once) instead of leaving the match
+        /// unendable; a Removed match end cannot be un-fired — AbortMatch is the recommended response.
+        /// </summary>
+        event Action<int, SimulationEvent, SyncedDivergenceKind> OnSyncedEventDivergence;
+
+        /// <summary>
+        /// Full-state resync complete event (restoredTick).
+        /// </summary>
+        event Action<int> OnResyncCompleted;
+
+        /// <summary>
+        /// Match was aborted (state transitioned to KlothoState.Aborted). UI / score / replay-save
+        /// branches should check IsEnded() instead of `== Finished` so abort paths are not silently
+        /// treated as normal end.
+        /// </summary>
+        event Action<AbortReason> OnMatchAborted;
+
+        /// <summary>
+        /// Transitions the engine to KlothoState.Aborted and fires OnMatchAborted with the given reason.
+        /// Idempotent: subsequent calls (or calls after Finished) are no-ops. The sole entry point for
+        /// the Aborted state — callers must not assign State directly.
+        /// </summary>
+        void AbortMatch(AbortReason reason);
+
+        /// <summary>
+        /// Raised after a corrective reset has been applied — state restored and match continues
+        /// (KlothoState.Running preserved). Distinct from OnMatchAborted (terminal). Skeleton event
+        /// — wired by the broadcast corrective-reset implementation.
+        /// </summary>
+        event Action<ResetReason> OnMatchReset;
+
+        /// <summary>
+        /// Raised when an empty input is needed for a disconnected player. Invoked synchronously when CanAdvanceTick fails.
+        /// </summary>
+        event Action<int> OnDisconnectedInputNeeded;
+
+        void NotifyPlayerDisconnected(int playerId);
+        void NotifyPlayerReconnected(int playerId);
+        void NotifyPlayerLeft(int playerId);
+        void PauseForReconnect();
+        void ForceInsertCommand(ICommand cmd);
+        /// <summary>
+        /// Range-fills empty commands for [fromTick, toTickInclusive] of a single player and
+        /// triggers a single chain-advance pass. Used by reactive fill to catch the chain
+        /// up to CurrentTick when a peer is presumed-dropped or transport-disconnected.
+        /// Each inserted entry is sealed so a late real packet at the same (tick, playerId)
+        /// is silently dropped — preserves InputBuffer ↔ simulation state consistency.
+        /// </summary>
+        void ForceInsertEmptyCommandsRange(int playerId, int fromTick, int toTickInclusive);
+        bool HasCommand(int tick, int playerId);
+
+        /// <summary>
+        /// Returns true if (tick, playerId) is currently sealed in the InputBuffer (by a
+        /// prior range-fill placeholder). Network layer uses this to suppress relay of late
+        /// real packets that would overwrite the sealed empty on other peers.
+        /// </summary>
+        bool IsCommandSealed(int tick, int playerId);
+
+        /// <summary>
+        /// Requests a deferred rollback to targetTick. Merged at frame end if multiple
+        /// requests target different ticks (smallest wins).
+        /// </summary>
+        void RequestRollback(int targetTick);
+
+        /// <summary>
+        /// Raised when full-state resync fails after the maximum retry count.
+        /// </summary>
+        event Action OnResyncFailed;
+
+        /// <summary>
+        /// Raised when a pending input or synced event is wiped during cleanup before the chain
+        /// has advanced past it (tick, playerId, kind). playerId is -1 for SyncedEvent wipes.
+        /// </summary>
+        event Action<int, int, WipeKind> OnPendingWipe;
+
+        /// <summary>
+        /// Raised on a client when the server rejects one of this client's commands (tick, commandTypeId, reason).
+        /// Hint-only — game code may clear local latches or surface to UI; loss is tolerated by design.
+        /// </summary>
+        event Action<int, int, RejectionReason> OnCommandRejected;
+
+        // ── Frame References ──
+
+        /// <summary>
+        /// Frame at the latest verified tick. Used as the source for remote entity snapshot interpolation.
+        /// Frame is null if outside the ring buffer range.
+        /// </summary>
+        FrameRef VerifiedFrame { get; }
+
+        /// <summary>
+        /// Live frame at CurrentTick. Used for local player predictive responsiveness.
+        /// </summary>
+        FrameRef PredictedFrame { get; }
+
+        /// <summary>
+        /// Mutable authoritative frame, valid ONLY during the OnInitializeWorld callback.
+        /// Use this to create the initial world entities. Accessing it at any other time
+        /// throws InvalidOperationException — it is not a render-time accessor (use
+        /// PredictedFrame for live reads).
+        /// </summary>
+        Frame InitFrame { get; }
+
+        /// <summary>
+        /// Frame at CurrentTick - 1. One side of the interpolation pair that absorbs the rate difference between the render clock and the simulation clock.
+        /// Frame is null if outside the ring buffer range.
+        /// </summary>
+        FrameRef PredictedPreviousFrame { get; }
+
+        /// <summary>
+        /// Head frame at the entry point of the previous Update.
+        /// The delta vs. the current Predicted becomes the input for visual correction (error visual) due to rollback.
+        /// </summary>
+        FrameRef PreviousUpdatePredictedFrame { get; }
+
+        /// <summary>
+        /// View-layer render clock state. Used by both the prediction path and the snapshot interpolation path.
+        /// </summary>
+        RenderClockState RenderClock { get; }
+
+        /// <summary>
+        /// Input prediction hit rate (0.0 ~ 1.0): 1 - (fraction of arrived predictions that
+        /// forced a rollback). P2P-only — the sole feed is the P2P command receive path; SD
+        /// re-prediction is not counted. Sampled: predictions cleared by a rollback before
+        /// their actual command arrived are not counted. Persistently low values signal a
+        /// too-thin timing buffer (raise InputDelayTicks / extra delay).
+        /// Returns <c>-1</c> (outside the 0~1 range) in ServerDriven mode, where the metric is
+        /// not measured — distinguishing "not measured" from a real perfect-accuracy 1.0.
+        /// </summary>
+        float PredictionAccuracy { get; }
+
+        /// <summary>
+        /// Looks up the frame at the specified tick from the ring buffer. Returns false if out of range.
+        /// </summary>
+        bool TryGetFrameAtTick(int tick, out Frame frame);
+
+        // ── Error Correction ──
+
+        /// <summary>
+        /// Error correction settings.
+        /// </summary>
+        ErrorCorrectionSettings ErrorCorrectionSettings { get; set; }
+
+        /// <summary>
+        /// Position delta produced by the rollback in this frame.
+        /// Returns (0,0,0) if there was no rollback or the entity is not tracked.
+        /// </summary>
+        (float x, float y, float z) GetPositionDelta(int entityIndex);
+
+        /// <summary>
+        /// Y-axis rotation delta (radians) produced by the rollback in this frame.
+        /// </summary>
+        float GetYawDelta(int entityIndex);
+
+        /// <summary>
+        /// Whether a teleport was detected for the entity during the rollback in this frame.
+        /// If true, the view-side visual correction accumulation must be reset.
+        /// </summary>
+        bool HasEntityTeleported(int entityIndex);
+
+        /// <summary>
+        /// Whether the engine is running in spectator mode. Prediction and rollback are not performed in spectator mode.
+        /// </summary>
+        bool IsSpectatorMode { get; }
+
+        /// <summary>
+        /// Starts the engine in spectator mode.
+        /// </summary>
+        void StartSpectator(SpectatorStartInfo info);
+
+        /// <summary>
+        /// Injects a confirmed command into the input buffer. Used in spectator mode and during Late Join catchup.
+        /// </summary>
+        void ReceiveConfirmedCommand(ICommand command);
+
+        void StartCatchingUp();
+        void StopCatchingUp();
+        void ConfirmCatchupTick(int tick);
+        event Action OnCatchupComplete;
+
+        void ExpectFullState();
+        void CancelExpectFullState();
+
+        /// <summary>
+        /// Raised periodically with a batch of verified inputs (startTick, tickCount, data, dataLength).
+        /// Handlers must process synchronously; the data buffer is released immediately after return.
+        /// </summary>
+        event Action<int, int, byte[], int> OnVerifiedInputBatchReady;
+
+        /// <summary>
+        /// Serializes verified inputs in the [fromTick, toTick] range.
+        /// Returns false if the range is outside the input buffer.
+        /// </summary>
+        bool TrySerializeVerifiedInputRange(int fromTick, int toTick, out byte[] data, out int dataLength);
+
+        /// <summary>
+        /// Returns the nearest snapshot tick within the input buffer range. Returns -1 if none exists.
+        /// </summary>
+        int GetNearestSnapshotTickWithinBuffer();
+
+        /// <summary>
+        /// Engine initialization for spectator mode. Operates without a network service.
+        /// </summary>
+        void Initialize(ISimulation simulation, IKLogger logger);
+
+        // ── PlayerConfig ──
+
+        /// <summary>
+        /// Returns the per-player custom config data. Null if not yet received.
+        /// </summary>
+        T GetPlayerConfig<T>(int playerId) where T : PlayerConfigBase;
+
+        /// <summary>
+        /// Returns the per-player custom config data. Returns false if not yet received.
+        /// </summary>
+        bool TryGetPlayerConfig<T>(int playerId, out T config) where T : PlayerConfigBase;
+
+        /// <summary>
+        /// Per-player opaque entitlement blob, or null when none. Server-authoritative trusted data
+        /// (not the client-authored PlayerConfig). The game reads this during tick-0 world init
+        /// (OnInitializeWorld, before SaveSnapshot(0)) to seed the simulation deterministically.
+        /// SD: returns the server's stored redeem outcome (null on the SD client — the seed effect
+        /// arrives baked into the Initial FullState). P2P: returns each peer's independently-verified
+        /// entitlement; every peer holds the same signed bytes, so seeding from them is deterministic.
+        /// </summary>
+        byte[] GetPlayerEntitlement(int playerId);
+
+        /// <summary>
+        /// Raised when player config data is received (playerId, firstTime).
+        /// firstTime is true if this is the first time the config for this player is received.
+        /// </summary>
+        event Action<int, bool> OnPlayerConfigReceived;
+    }
+}

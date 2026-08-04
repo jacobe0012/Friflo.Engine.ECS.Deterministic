@@ -1,0 +1,31 @@
+<!--
+  Klotho.Tests — determinism / rollback verification for the Friflo <-> Klotho bridge.
+  NUnit 3 to match the convention of src/Tests/Tests.csproj.
+-->
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <AssemblyName>Klotho.Tests</AssemblyName>
+    <RootNamespace>Klotho.Friflo.Tests</RootNamespace>
+    <IsPackable>false</IsPackable>
+    <!-- Allocation assertions need predictable inlining of the snapshot paths. -->
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
+    <PackageReference Include="NUnit" Version="3.13.3" />
+    <PackageReference Include="NUnit3TestAdapter" Version="4.6.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Bridge\Klotho.Friflo.Bridge.csproj" />
+    <ProjectReference Include="..\Runtime\Klotho.Runtime.csproj" />
+    <ProjectReference Include="..\..\ECS\Friflo.Engine.ECS.csproj" />
+  </ItemGroup>
+
+</Project>

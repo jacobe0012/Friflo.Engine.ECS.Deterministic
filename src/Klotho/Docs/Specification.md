@@ -1,0 +1,1410 @@
+# xpTURN.Klotho Engine Specification
+
+> The deterministic Klotho simulation framework.
+> Includes prediction/rollback-based multiplayer synchronization, fixed-point math, a replay system, and ECS.
+
+---
+
+## Core Philosophy
+
+### Deterministic Simulation
+
+All clients are guaranteed **same input → same result**.
+Floating-point (`float`) is excluded; the simulation is built solely on 32.32 fixed-point (`FP64`) and a deterministic RNG (`Xorshift128+`), ensuring full reproducibility across platforms and compilers.
+
+### Speculative Execution
+
+The same principle as CPU pipeline branch prediction is applied to networked games.
+
+| Concept | CPU Pipeline | Klotho |
+| ---- | ---- | ---- |
+| Prediction target | Conditional branch outcome | Remote player input |
+| Prediction strategy | Branch history statistics | Repeat last input |
+| Predicted execution | Pipeline advances on the predicted result | Simulation advances on predicted input |
+| Prediction hit | Result is committed as-is | No rollback needed |
+| Prediction miss | Pipeline flush + re-execution | Snapshot restore + re-simulation (rollback) |
+
+The simulation **advances immediately** with predicted input rather than waiting for remote input to arrive; on misprediction, accuracy is recovered via snapshot restore + re-simulation.
+
+### Distributed Authority
+
+In a server-less P2P topology, **every client holds equal simulation authority**.
+Each client only generates its own input and independently simulates the entire world state.
+State consistency is verified by periodic hash comparison (`SyncCheck`); on mismatch (desync), an event is raised.
+
+### Minimal Bandwidth
+
+Only **inputs (commands)** are transmitted over the network.
+World state is never fully synchronized, so bandwidth is independent of entity count.
+Input delay (`InputDelayTicks`) absorbs network round-trip time, minimizing prediction/rollback frequency.
+
+### Zero GC Allocation
+
+Runtime GC allocation is minimized to prevent frame spikes.
+Strategies applied: object pooling (`DictionaryPoolHelper`, `ListPoolHelper`, `PooledMemoryStream`), cached fields, no LINQ, avoidance of closure captures, etc.
+
+### Engine Independence
+
+The Klotho engine layer is designed to be **fully engine-independent** (no Unity or Godot API).
+Direct dependencies on any engine API (`MonoBehaviour` / `UnityEngine.*`, `Node` / `Godot.*`) are excluded, so that the same simulation core can be **executed unchanged under the Unity and Godot (.NET) adapters and on the server side (.NET console / ASP.NET)**.
+
+| Use Case | Description |
+| ---- | ---- |
+| Authoritative Server | Run the same simulation on the server for cheat prevention and result verification |
+| Replay Verification Server | Re-execute replay data on the server to verify result integrity |
+| Headless Testing | Run simulation tests in CI/CD pipelines without the Unity Editor |
+| Matchmaking Simulation | Drive AI matches or perform balance tests on the server |
+
+**Implementation Principles**:
+
+- The engine core (`KlothoEngine`, `ISimulation`, `InputBuffer`, `FP64`, `Frame`, etc.) is pure C# — references to the `UnityEngine` namespace are forbidden
+- Engine integration (rendering, input collection, MonoBehaviour / Node lifecycle) is handled in separate **adapter/bridge layers** — `Unity/` for Unity, `Godot~/Adapters/` for Godot
+- External dependencies such as `INetworkTransport` and `ILogger` are isolated behind interface abstractions
+
+### Network Layer Separation
+
+"Network" (netcode) here means not just socket I/O but the **entire infrastructure** involved in multiplayer synchronization.
+
+```text
+┌───────────────────────────────────────────┐
+│         Game Service Layer                │  ← gRPC RPC
+│  Lobby · Matchmaking · Auth · Chat        │     TCP-based, reliability-focused
+├───────────────────────────────────────────┤
+│         Simulation Transport Layer        │  ← LiteNetLib (UDP)
+│  Input · InputAck · SyncCheck · Handshake │     low latency, per-channel delivery
+├───────────────────────────────────────────┤
+│         Klotho Engine Layer               │  ← xpTURN.Klotho (pure C#)
+│  Prediction · Rollback · Snapshots · Det. │     engine-independent, server-shared
+└───────────────────────────────────────────┘
+```
+
+Simulation transport (UDP) and game services (RPC) are separated so each layer uses the optimal protocol and delivery method.
+The Klotho engine layer is pure C#, so the same binary can be shared by client and server.
+The lobby→session credential handoff that crosses this boundary (ticket carriage, validation hooks, identity propagation) is specified in Player Identity Handoff (§9.6).
+
+---
+
+## 1. Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Game Application                         │
+│   (ISimulation impl: EcsSimulation or custom Simulation)    │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+         ┌──────────────────┼──────────────────┐
+         ▼                  ▼                  ▼
+  ┌──────────────┐   ┌──────────────┐   ┌─────────────────┐
+  │ KlothoEngine │   │ReplaySystem  │   │KlothoNetwork    │
+  │(orchestrator)│◄  │(record/play) │   │   Service       │
+  └──────┬───────┘   └──────────────┘   └────────┬────────┘
+         │                                       │
+    ┌────┴────┐                            ┌─────┴──────┐
+    ▼         ▼                            ▼            ▼
+┌────────┐ ┌──────────┐            ┌────────────┐ ┌──────────┐
+│ISimula-│ │InputBuf- │            │INetwork    │ │Network   │
+│tion    │ │fer       │            │Transport   │ │Messages  │
+└───┬────┘ └──────────┘            └────────────┘ └──────────┘
+    │
+    ├──── (ECS) Frame ──── EntityManager + ComponentStorage[]
+    ├──── SystemRunner ──── ISystem[]
+    ├──── FrameRingBuffer (ECS snapshots)
+    └──── RingSnapshotManager (IStateSnapshot)
+
+  ┌──────────────────────────────────┐
+  │       Math (Deterministic)       │
+  │  FP64 · FPVector2 · FPVector3    │
+  └──────────────────────────────────┘
+```
+
+### Directory Layout
+
+```
+<repo root>/                            ← this repo
+├── com.xpturn.klotho/                 ← ★ framework package (UPM `?path=`)
+│   ├── package.json
+│   ├── Runtime/
+│   │   ├── Core/           KlothoEngine, KlothoSession, KlothoSessionSetup,
+│   │   │                   IKlothoEngine, IKlothoSession,
+│   │   │                   ISimulationCallbacks, IViewCallbacks,
+│   │   │                   ISimulationConfig, ISessionConfig, SimulationConfig, SessionConfig,
+│   │   │                   NetworkMode, ICommand, CommandFactory, CommandRegistry,
+│   │   │                   ICommandSender, WarmupRegistry, DedicatedServerLoop,
+│   │   │                   Pool(CommandPool, EventPool, ListPool, DictionaryPool, StreamPool),
+│   │   │                   SimulationEvent, EventBuffer, EventCollector, EventDispatcher,
+│   │   │                   ModuleInitializerHelper
+│   │   ├── Logging/        xpTURN.Klotho.Logging (IKLogger, KLoggerFactory, KLogBuilder,
+│   │   │                   KLogHandlers — interpolated handlers, Sinks)
+│   │   ├── Gameplay/       built-in component / system / command / event reference implementations
+│   │   │                   (xpTURN.Klotho.Gameplay, noEngineReferences)
+│   │   ├── Diagnostics/    FaultInjection, FaultInjectionLoader, RttSpikeMetricsCollector
+│   │   ├── Input/          IInputBuffer, IInputPredictor, IInputHandler, InputBuffer
+│   │   ├── Network/        IKlothoNetworkService, IServerDrivenNetworkService, INetworkTransport,
+│   │   │                   KlothoNetworkService, ServerDrivenClientService, ServerNetworkService,
+│   │   │                   ISpectatorService, SpectatorService,
+│   │   │                   Room, RoomManager, RoomRouter, RoomScopedTransport, ServerLoop,
+│   │   │                   ServerInputCollector, NetworkMessages, MessageRegistry, SharedTimeClock
+│   │   ├── State/          IStateSnapshot, IStateSnapshotManager, RingSnapshotManager
+│   │   ├── Serialization/  SpanWriter, SpanReader, SerializationBuffer, ISpanSerializable
+│   │   ├── Replay/         IReplaySystem, ReplayRecorder, ReplayPlayer, ReplayData
+│   │   ├── ECS/            Frame, EntityManager, ComponentStorage, ComponentStorageRegistry,
+│   │   │                   EntityPrototypeRegistry, IEntityPrototype, SystemRunner,
+│   │   │                   FrameRingBuffer, EcsSimulation, FixedString32/64,
+│   │   │                   ISystem/IInitSystem/ICommandSystem/ISyncEventSystem/ISignal family
+│   │   │                   DataAsset/ (IDataAsset, DataAssetRegistry, DataAssetRef,
+│   │   │                               DataAssetReader/Writer, [KlothoDataAsset(typeId)],
+│   │   │                               Json/ — xpTURN.Klotho.DataAsset.Json assembly)
+│   │   ├── Deterministic/  FP64, FPVector2/3/4, FPQuaternion, FPMatrix, FPPhysicsWorld,
+│   │   │                   FPStaticCollider, FPStaticBVH, FPStaticColliderSerializer,
+│   │   │                   FPNavMesh, FPNavMeshSerializer, NavAgentComponent, FPNavAgentSystem,
+│   │   │                   DeterministicRandom, FPAnimationCurve, etc.
+│   │   ├── LiteNetLib/     LiteNetLibTransport — INetworkTransport implementation
+│   │   │                   (xpTURN.Klotho.LiteNetLib, noEngineReferences)
+│   │   └── ThirdParty/     vendored: LiteNetLib.v2.1.4 (UDP networking)
+│   ├── Unity/              Unity adapter — USimulationConfig, USessionConfig, EcsDebugBridge,
+│   │                       View/ (EntityView, EntityViewComponent, EntityViewFactory,
+│   │                              EntityViewUpdater, IEntityViewPool, DefaultEntityViewPool,
+│   │                              BindBehaviour, ViewFlags, VerifiedFrameInterpolator,
+│   │                              UpdatePositionParameter, ErrorVisualState)
+│   │                       FPStaticColliderOverride, FPStaticColliderVisualizer,
+│   │                       Logging/ (UnityDebugSink, KLogBuilderUnityExtensions)
+│   │   └── Editor/         NavMesh/ (FPNavMeshExporter, Visualizer Window/Overlay/Simulator/Interaction)
+│   │                       Physics/ (FPStaticColliderExporterWindow, FPStaticColliderConverter)
+│   │                       ECS/ (EntityComponentVisualizerWindow, FrameHeapBenchmarkWindow)
+│   │                       FSM/ (HFSMVisualizerWindow)
+│   │                       DataAsset/ (JsonToBytesConverter)
+│   ├── Godot~/             Godot (.NET) adapter — Adapters/ (EntityViewNode, EntityViewUpdaterNode,
+│   │                       GodotSessionDriver, GodotConnectionAsync, GodotSessionFlowAsync,
+│   │                       GodotFlowSetupBuilderExtensions (WithGodotDefaults),
+│   │                       GodotSimulationConfig/GodotSessionConfig (Resource), GodotDebugSink/GodotLogSink,
+│   │                       GodotKlothoLogger (CreateDefault), GodotDeviceIdProvider,
+│   │                       GodotReconnectCredentialsStore,
+│   │                       Deterministic/ FPRay3·FPPlane·FPBounds3 Godot conversion helpers)
+│   │                       · Packaging/ · plugin.cfg/plugin.gd
+│   │   └── Adapters/Editor/  Godot editor tools — NavMesh (GodotFPNavMeshExporter, Visualizer/Dock/Overlay/Simulator/Interaction),
+│   │                       StaticCollider (GodotFPStaticColliderExporter/Converter/Viewer),
+│   │                       DataAsset (KlothoDataAssetConvertTool, KlothoJsonContextMenu) · plugin.gd EditorPlugin
+│   ├── Plugins/Analyzers/  KlothoGenerator.dll (Roslyn source generator, RoslynAnalyzer label)
+│   ├── Plugins~/Logging.Mel/  opt-in MEL interop adapter (UPM "Import Sample" → MEL Logging Plugin)
+│   └── Server~/            dedicated-server build assets (per-assembly csproj mirroring client
+│                           asmdefs + KlothoServer/: KlothoServerBootstrap, ConfigPathResolver,
+│                           Session/SimulationConfigLoader)
+│
+├── Samples/                ← standalone sample projects (each consumes the package via `file:`)
+│   ├── Brawler/            4-player fighting-game sample (+ dedicated server, NavMesh, tests)
+│   ├── P2pSample/          minimal P2P sample (Unity)
+│   ├── SdSample/           minimal ServerDriven sample (Unity client + .NET 8 dedicated server)
+│   ├── GodotP2pSample/     minimal P2P sample (Godot .NET)
+│   ├── GodotSdSample/      minimal ServerDriven sample (Godot client + .NET 8 dedicated server)
+│   └── LoggingMelConsole/  .NET console sample (IKLogger → Microsoft.Extensions.Logging)
+│
+├── Docs/                   ← documentation
+└── Tools/                  ← .NET tooling (not redistributed)
+    ├── KlothoGenerator/         Roslyn source generator project (built by gen.sh)
+    ├── KlothoGenerator.Tests/   generator unit tests
+    ├── DeterminismVerification/ determinism verification (.NET console)
+    ├── PhysicsDeterminismProbe/ cross-platform FP determinism probe
+    └── gen.sh                   generator build script
+```
+
+---
+
+## 2. Core Engine
+
+### 2.1 State Machine
+
+```
+         Initialize()
+            │
+            ▼
+  ┌──── [ Idle ] ◄──── Stop()
+  │         │
+  │     Start()
+  │         │
+  │         ▼
+  │  [WaitingForPlayers]
+  │         │
+  │     AllPlayersReady
+  │         │
+  │         ▼
+  │    [ Running ] ◄──── Resume()
+  │      │      │
+  │  Pause()  Stop()
+  │      │      │
+  │      ▼      ▼
+  │  [Paused] [Finished]
+  │      │
+  │   Resume()
+  │      │
+  └──────┘
+```
+
+| State | Description |
+| ---- | ---- |
+| Idle | Initial state. Engine not started |
+| WaitingForPlayers | Waiting for all players to connect / be ready |
+| BootstrapPending | (SD server only) Awaiting all players' bootstrap-ready acks (or timeout) before the first tick. Blocks `UpdateServerTick` via the existing `State == Running` gate |
+| Running | Simulation in progress |
+| Paused | Paused (waiting for input or manual) |
+| Ending | Transient: tick advance frozen while transport keepalives continue. Reached when `EndGracePolicy.Pause` is selected at match end — `ExecuteTick` is blocked, input is buffered but not processed |
+| Finished | Game over or manually stopped |
+| Aborted | Match aborted before completion (chain stall timeout, catastrophic divergence, etc.). Distinct from `Finished` so replay-save / score-aggregation / normal-end UI can branch. Pair with `AbortReason` via `OnMatchAborted`. Use `KlothoStateExtensions.IsEnded()` for terminal-state check (covers both `Finished` and `Aborted`) |
+
+### 2.2 Default Configuration Values
+
+Configuration is split into two layers.
+- **`SimulationConfig` / `ISimulationConfig`** — Simulation parameters (affect determinism, identical across all peers). Injected via `KlothoSessionSetup.SimulationConfig`. Editor-authorable via `USimulationConfig` ScriptableObject (Unity) or `GodotSimulationConfig` Resource (Godot, `[Export]` fields) — both implement `ISimulationConfig`.
+- **`SessionConfig` / `ISessionConfig`** — Session operation parameters (decided by the host, propagated via GameStart / LateJoinAccept / SpectatorAccept messages). Injected via `KlothoSessionSetup.SessionConfig` — replaces the previous per-field mirror set (RandomSeed/MaxPlayers/MinPlayers/AllowLateJoin/LateJoinDelayTicks/ReconnectTimeoutMs/ReconnectMaxRetries/LateJoinDelaySafety/RttSanityMaxMs/MinStallAbortTicks/CountdownDurationMs). Editor-authorable via `USessionConfig` ScriptableObject (Unity) or `GodotSessionConfig` Resource (Godot); `Create()` copies the values into the engine-owned `SessionConfig` (assets are never mutated).
+
+#### SimulationConfig Defaults
+
+| Field | Default | Unit | Description |
+| ---- | ---- | ---- | ---- |
+| TickIntervalMs | 25 | ms | Tick interval (= 40 ticks/sec). Range: 1 or greater (typically 16~50ms) |
+| InputDelayTicks | 4 | ticks | Local-input delay shift. Effective input delay = TickIntervalMs × InputDelayTicks (= 100 ms). Range: 0 or greater (typically 2~6) |
+| MaxRollbackTicks | 50 | ticks | Maximum rollback range. Determines snapshot ring buffer + input-buffer retention. Must be ≥ SyncCheckInterval (≥ 2× recommended) |
+| SyncCheckInterval | 20 | ticks | State-hash verification period. ≤ MaxRollbackTicks/2 recommended — values above are clamped to the effective interval at runtime so a desync rollback to the last matched anchor stays within the rollback window |
+| UsePrediction | true | bool | Whether input prediction is enabled. False → engine waits for all inputs (Paused) |
+| MaxEntities | 256 | entities | ECS entity capacity (EntityManager array size) |
+| Mode | P2P | NetworkMode | Network topology (P2P / ServerDriven). Discriminator for SD-only fields |
+| HardToleranceMs | 0 | ms | (SD) **Deprecated — no effect.** The effective server deadline is the tick's execution moment: inputs missing at execution are substituted with `EmptyCommand`, later arrivals are past-tick rejected, and chronic lateness self-corrects via client lead escalation. Property and wire fields retained for serialized-asset / message compatibility only |
+| InputResendIntervalMs | 25 | ms | (SD) Interval at which the client resends unacknowledged inputs |
+| MaxUnackedInputs | 30 | count | (SD) Cap on accumulated unacknowledged inputs (warning emitted on overflow) |
+| ServerSnapshotRetentionTicks | 0 | ticks | (SD) Server snapshot ring-buffer slots. **0 = auto** (TickRate × 10). Independent of MaxRollbackTicks — used for FullStateRequest replies |
+| SDInputLeadTicks | 0 | ticks | (SD) Initial client lead ticks at game start. **0 = auto (default 10)**. Reused on LateJoin/Reconnect. Additive with InputDelayTicks |
+| EnableErrorCorrection | false | bool | Enable Error Correction (default off). Enable selectively in high-latency / multiplayer scenarios |
+| InterpolationDelayTicks | 3 | ticks | View-layer snapshot interpolation delay (used by RenderClock.VerifiedBaseTick = LastVerifiedTick - InterpolationDelayTicks). Recommended [1, 3]. Fixed value — applied as-is by the live render clock, no dynamic adjustment |
+| LateJoinDelaySafety | 2 | ticks | Safety margin added to RTT-based extra-delay computation on Sync / LateJoin / Reconnect. Also used as the standalone fallback when avgRtt is invalid / out of the sane range |
+| RttSanityMaxMs | 240 | ms | Upper bound for accepting avgRtt as a sane measurement. Samples exceeding this fall back to `LateJoinDelaySafety` only |
+| QuorumMissDropTicks | 20 | ticks | (P2P) Quorum-miss watchdog threshold. If a remote peer's input is missing at `_lastVerifiedTick + 1` for at least this many ticks, the peer is presumed-dropped and reactive empty-fill activates before the transport-level DisconnectTimeout. 0 disables. Safe range 10~80 |
+| MinStallAbortTicks | 600 | ticks | (P2P) Chain-stall watchdog threshold (peer-local). Aborts the match via `AbortMatch(AbortReason.ChainStallTimeout)` when `CurrentTick - LastVerifiedTick` exceeds `max(SessionConfig.ReconnectTimeoutMs / TickIntervalMs + 100, MinStallAbortTicks)`. Default 600 = 30s @ 50ms TickInterval. Guards against `ReconnectTimeoutMs` misconfiguration shorter than recovery floor |
+| EventDispatchWarnMs | 5 | ms | Warning threshold for OnEvent* handler execution time (dev-diagnostic — see note below). 0 or less = disabled |
+| TickDriftWarnMultiplier | 2 | × | Tick-loop drift warning multiplier (warns if actual interval > TickIntervalMs × multiplier). 0 or less = disabled |
+| StageId | 0 | int | Match stage/content selector, set per-match by the authority and propagated to all peers. 0 = default single stage. The game maps it to stage assets; the engine only carries it |
+| MatchConfigData | null | byte[] | Opaque, game-defined per-match config (game mode / rules / difficulty), set per-match by the authority and propagated. null/empty = none. The engine carries only the bytes — the game owns the codec |
+
+> **Dev-diagnostic build symbols (cross-engine note)**: the core gates many diagnostics — including the `EventDispatchWarnMs` warning — behind `#if DEVELOPMENT_BUILD || UNITY_EDITOR`. Both are **Unity-defined** symbols. On Unity they are active in the Editor / development builds automatically. On **Godot (.NET) and the .NET dedicated server** neither symbol is defined by default, so these diagnostics are **compiled out** — define `DEVELOPMENT_BUILD` in your game `.csproj` (`<DefineConstants>`) to enable them.
+
+#### SessionConfig Defaults
+
+| Field | Default | Unit | Description |
+| ---- | ---- | ---- | ---- |
+| RandomSeed | 0 | int | If 0, auto-generated via `Environment.TickCount` (host) |
+| MaxPlayers | 4 | count | Max players in a room |
+| MaxSpectators | 0 | count | Max spectators allowed in the session. Combined with MaxPlayers as the transport-level capacity (`MaxPlayersPerRoom + MaxSpectatorsPerRoom`) for spectator admission. 0 means spectators are not admitted. |
+| MinPlayers | 2 | count | Min players required to start. Range: 1 ≤ MinPlayers ≤ MaxPlayers (clamped at SessionConfigLoader.Load and KlothoSession.Create with a warning log; SD start gate also clamps to MaxPlayersPerRoom at runtime). |
+| AllowLateJoin | true | bool | Whether mid-game join is allowed |
+| ReconnectTimeoutMs | 60000 | ms | Reconnect timeout |
+| ReconnectMaxRetries | 3 | tries | Max reconnect attempts |
+| LateJoinDelayTicks | 10 | ticks | Late-join activation delay |
+| ResyncMaxRetries | 3 | tries | Max resync attempts |
+| DesyncThresholdForResync | 3 | count | Desync count that triggers resync |
+| CorrectiveResetCooldownMs | 5000 | ms | (P2P, host-only) Minimum interval between consecutive corrective-reset broadcasts. Prevents broadcast storms when persistent hash divergence fires `OnHashMismatch` repeatedly |
+| CorrectiveResetMaxAttempts | 2 | tries | (P2P, host-only) Corrective-reset attempts the host spends per divergence episode (recovery ladder rung 3), fed by guest `ResyncFailureReport` messages. Attempts decay to zero after a quiet period of `CorrectiveResetCooldownMs × 2` without failure reports. Host-local — not propagated via `SimulationConfigMessage` |
+| AutoAbortOnRecoveryExhausted | true | bool | (P2P, host-only) When corrective-reset attempts are exhausted (rung 4), the host broadcasts `MatchAbort` and aborts locally with `AbortReason.StateDivergence`. `false` logs an error and leaves the decision to the game layer. Host-local |
+| CountdownDurationMs | 3000 | ms | Game-start countdown length |
+| CatchupMaxTicksPerFrame | 200 | ticks | Max ticks per frame during catchup |
+| AbortGraceMs | 1500 | ms | Post-match grace duration on abort. Time between `OnMatchAborted` fire and `Room.State` transition to `Draining`, giving clients time to display the error dialog and the server side time for abort logging |
+| EndGracePolicy | Continue | enum | Simulation behavior during the post-match grace window. `Continue` keeps the simulation running (input/heartbeat/replay continuity); `Pause` halts tick advancement (`Running` → `Ending`) |
+| EndGraceMs | 5000 | ms | Post-match grace duration on normal end. Time between `OnMatchEnded` fire and `Room.State` transition to `Draining`, giving clients time to display the result screen and the server side time for any post-processing hook. Range: 0 (immediate drain, debug/integration only) or greater |
+| ClientShutdownGraceMs | 4500 | ms | Client-side grace duration on normal end. Time between `OnMatchEnded` on the client and the client's self-initiated session shutdown, so the result screen plays out before the chain-stall warning storm begins. Must stay below `EndGraceMs` — inversion risks chain-stall warnings |
+| Old-data cleanup threshold | CurrentTick - MaxRollbackTicks - 10 | ticks | Threshold for discarding old data |
+
+### 2.3 Events
+
+| Event | Signature | Fired |
+| ---- | ---- | ---- |
+| OnTickExecuted | `Action<int>` | After every tick is executed (passes tick number) |
+| OnTickExecutedWithState | `Action<int, FrameState>` | After every tick (tick, Predicted/Verified) |
+| OnFrameVerified | `Action<int>` | On Predicted → Verified transition |
+| OnChainAdvanceBreak | `Action` | Verified-chain advance failed at the next tick (P2P: pending input for an active player). Drives reactive empty-fill / dynamic-delay escalation |
+| OnDesyncDetected | `Action<long, long>` | State-hash mismatch detected (localHash, remoteHash). The network-service variant (§9.5) is the extended `Action<int,int,long,long>` |
+| OnHashMismatch | `Action<int, long, long>` | Hash gate detected a mismatch after `ApplyFullState` (tick, localHash, remoteHash). Wired in P2P to trigger `TryCorrectiveReset` (host only). Fires from all 5 `ApplyFullState` entry points (LateJoin / InitialFullState / ResyncRequest / CorrectiveReset / Reconnect) |
+| OnRollbackExecuted | `Action<int, int>` | Rollback completed (fromTick, toTick) |
+| OnRollbackFailed | `Action<int, string>` | Rollback failed (requestedTick, reason) |
+| OnPendingWipe | `Action<int, int, WipeKind>` | A pending input or Synced event was wiped during cleanup before the chain advanced past it (tick, playerId, kind). `playerId = -1` for `WipeKind.SyncedEvent` |
+| OnCommandRejected | `Action<int, int, RejectionReason>` | (SD client) Server rejected a client input (tick, cmdTypeId, reason). For commands issued via `engine.IssueOnce(Func<ICommand>, ReliabilityPolicy)`, the framework `ReliableCommandTracker` intercepts this internally and applies the policy: `TreatDuplicateAsAck=true` resolves the handle on `Duplicate`; `TreatPastTickAsEscalation=true` advances `CurrentExtraDelay` by `ExtraDelayStep` (capped at `ExtraDelayMax`) and clears the retry cooldown for an immediate re-issue. Game-side `OnCommandRejected` subscribers still receive the event for non-handle commands (game-specific telemetry / response). A command marked `IReliableCommand` takes the ServerDriven authoritative-placement path instead (server assigns the execution tick via `ReliableCommandSubmit`, no PastTick/Duplicate reject loop) — the retry/escalation described here applies to the legacy path (plain `IssueOnce` commands, and P2P). |
+| OnExtraDelayChanged | `Action<int>` | Recommended extra InputDelay (ticks) changed. Fired on `ApplyExtraDelay` (Sync / LateJoin / Reconnect / DynamicPush) and `EscalateExtraDelay` (reactive escalation) |
+| OnEventPredicted | `Action<int, SimulationEvent>` | Event raised on a Predicted tick |
+| OnEventConfirmed | `Action<int, SimulationEvent>` | First firing of a Regular event that was confirmed without prediction (verified-direct, replay, new on rollback) |
+| OnEventCanceled | `Action<int, SimulationEvent>` | Predicted event canceled by rollback |
+| OnSyncedEvent | `Action<int, SimulationEvent>` | Synced event — fired only on verified ticks |
+| OnResyncCompleted | `Action<int>` | Full state resync completed (restoredTick) |
+| OnResyncFailed | `Action` | Failed after exceeding max resync retries |
+| OnMatchAborted | `Action<AbortReason>` | Match terminated mid-play via `AbortMatch` (state transitions to `Aborted`). Reasons: `ChainStallTimeout` / `StateDivergence` / `ReconnectFailed` / `Unknown` |
+| OnMatchReset | `Action<ResetReason>` | Corrective reset applied — state restored, match continues (`Running` preserved). Sibling to `OnMatchAborted` (terminal). Reasons: `StateDivergence` / `ManualResync` / `Unknown` |
+| OnMatchEnded | `Action<int, IMatchEndEvent>` | Normal match-end signaled by a verified `IMatchEndEvent` (Synced). Fires exactly once per match on first verification (tick, event). Drives the grace-driven `Room` drain (`EndGraceMs` / `ClientShutdownGraceMs`) and, when `EndGracePolicy.Pause` is set, the `Running → Ending` transition. The event may additionally implement `IMatchResultProvider`, exposing a game-authored opaque result payload (`MatchResultData : byte[]`, null = none) for the server authority to read here — the engine carries only the bytes, the game owns the codec |
+| OnDisconnectedInputNeeded | `Action<int>` | Empty-input request for a disconnected player (playerId) |
+| OnCatchupComplete | `Action` | Late-join catchup completed |
+| OnVerifiedInputBatchReady | `Action<int, int, byte[], int>` | Verified input batch ready for spectators (startTick, tickCount, data, length) |
+| OnStateChanged | `Action<KlothoState>` | `KlothoEngine.State` transitioned (`Initial → Ready → Running → Ending → Finished` / `Aborted`). Surfaced to the game as `IKlothoSessionObserver.OnStateChanged` so game code does not poll the engine each frame |
+
+**FrameState**:
+
+| Value | Description |
+| ---- | ---- |
+| Predicted | Tick executed with at least one predicted input |
+| Verified | All player inputs confirmed and all prior ticks verified |
+
+### 2.4 Main Game Loop
+
+```
+KlothoEngine.Update(float deltaTime):
+│
+├─ NetworkService.Update()               // network receive
+├─ _accumulator += deltaTime * 1000f     // accumulate, converted to ms
+│
+└─ while _accumulator >= TickIntervalMs:
+   │
+   ├─ if InputBuffer.HasAllCommands(tick, playerCount):
+   │     ExecuteTick()                    // execute with confirmed inputs
+   │
+   ├─ elif UsePrediction:
+   │     ExecuteTickWithPrediction()      // execute with predicted inputs
+   │
+   └─ _accumulator -= TickIntervalMs
+```
+
+### 2.5 Tick Execution Flow
+
+```
+ExecuteTick():
+├─ commands = InputBuffer.GetCommandList(CurrentTick)
+├─ if ReplaySystem.IsRecording:
+│     ReplaySystem.RecordTick(CurrentTick, commands)
+├─ SaveSnapshot(CurrentTick)              // snapshot every tick
+├─ EventCollector.BeginTick(CurrentTick)
+├─ Simulation.Tick(commands)              // run simulation
+├─ store collected events into EventBuffer
+├─ if CurrentTick % SyncCheckInterval == 0:
+│     hash = Simulation.GetStateHash()
+│     _localHashes[CurrentTick] = hash
+│     NetworkService.SendSyncHash(CurrentTick, hash)
+├─ CurrentTick++
+├─ OnTickExecuted(executedTick)
+└─ OnTickExecutedWithState(executedTick, FrameState.Verified)
+```
+
+### 2.6 Simulation Tick Execution Order (EcsSimulation)
+
+```
+EcsSimulation.Tick(commands):
+  1. SystemRunner.RunCommandSystems(frame, cmd) — PreUpdate: apply commands
+  2. SystemRunner.RunUpdateSystems(frame)       — Update → PostUpdate → LateUpdate
+  3. frame.Tick++
+```
+
+### 2.7 KlothoSession & Callback Interfaces
+
+The entry point connecting game code to the engine. Callbacks are split into deterministic-common and view-only.
+
+```
+ISimulationCallbacks (game-implemented — common to deterministic side)
+  RegisterSystems(EcsSimulation)          ← register systems (before Initialize)
+  OnInitializeWorld(IKlothoEngine)        ← create initial entities (before SaveSnapshot(0))
+  OnPollInput(playerId, tick, sender)     ← per-tick input polling
+  OnPlayerJoinedWorld(engine, frame, playerId) ← seed a late-joiner's world at its join tick (late-join analog of OnInitializeWorld)
+
+IViewCallbacks (game-implemented — client view only, non-determinism allowed)
+  OnGameStart(IKlothoEngine)              ← once at game start
+  OnTickExecuted(tick)                    ← view update
+  OnLateJoinActivated(IKlothoEngine)      ← once after late-join catchup completes
+
+KlothoSession.Create(KlothoSessionSetup) → KlothoSession
+  Engine          : KlothoEngine
+  Simulation      : EcsSimulation
+  NetworkService  : IKlothoNetworkService
+  CommandFactory  : CommandFactory
+  HostGame(roomName, maxPlayers)
+  JoinGame(roomName)
+  LeaveRoom()
+  SendPlayerConfig(PlayerConfigBase)
+  SetReady(bool)
+  Update(float dt)                              ← pumped by the driver: Unity MonoBehaviour.Update / Godot Node._Process
+  Stop(keepReconnectCredentials = false)        ← keep=true on process-exit paths to preserve cold-start credentials
+  IsStopped                                     ← teardown completed
+  PlayerCount        ← unified getter: NetworkService → SpectatorService → 0 fallback
+  StateChanged           : event Action<KlothoState>
+  PhaseChanged           : event Action<SessionPhase>
+  PlayerCountChanged     : event Action<int>
+  AllPlayersReadyChanged : event Action<bool>
+
+KlothoSessionFlow (recommended construction layer)
+  StartHost(simCfg, sessionCfg)                                              → P2P host (sync)
+  JoinP2PAsync(transport, host, port, sessionCfg, ct)                        → P2P guest
+  JoinServerDrivenAsync(transport, host, port, roomId, sessionCfg, ct)       → SD client
+  ReconnectAsync(transport, creds, sessionConfigSeed, ct)                    → cold-start reconnect (creds: PersistedReconnectCredentials)
+  SpectateAsync(host, port, roomId, ct)                                      → spectator (factory transport)
+  StartReplayFromFile(path)                                                  → file → KlothoSession (throws ReplayLoadException)
+  (session creation is observed via IKlothoSessionObserver.OnSessionCreated(session, kind) — branch on kind)
+
+KlothoSessionDriver (MonoBehaviour adapter — Runtime.Unity) / GodotSessionDriver (Node adapter — Godot~/Adapters)
+  PreSessionUpdate / PostSessionUpdate / Stopping                            → lifecycle hooks
+  BindTransport(transport, observer, flow)                                   → driver owns idle transport pumping + idle-disconnect routing → IKlothoSessionObserver.OnIdleDisconnected
+  Attach(session) / DetachAndStop(keepReconnectCredentials = false)          → ownership transfer; OnDestroy passes keep=true; DetachAndStop is idempotent (internal re-entry guard)
+  (Unity drives via MonoBehaviour.Update; Godot drives via Node._Process — same Session.Update underneath)
+
+KlothoSessionSetup (Create input — direct path)
+  Logger · SimulationCallbacks · ViewCallbacks
+  Transport (host) / Connection (guest)
+  SimulationConfig · AssetRegistry
+  RandomSeed · MaxPlayers · AllowLateJoin · Reconnect/LateJoin/Resync/Countdown parameters
+
+KlothoFlowSetup (Flow input — bundles long-lived dependencies)
+  Logger · Transport · AssetRegistry · CredentialsStore · AppVersion · DeviceIdProvider
+  LifecycleObserver (IKlothoSessionObserver) · CallbacksFactory(simCfg, sessionCfg)
+  InitialPlayerConfigFactory : Func<PlayerConfigBase>   ← auto SendPlayerConfig on guest / reconnect
+  SpectatorTransportFactory  : Func<INetworkTransport>  ← invoked from SpectateAsync(host,port,roomId,ct)
+```
+
+**Teardown invariant**: `IKlothoSessionObserver.OnSessionStopped` is invoked from both teardown entry paths (Driver.DetachAndStop → Session.Stop and direct Session.Stop). Re-entry is made idempotent by library-level guards (`KlothoSession._stopped`, `KlothoSessionDriver._stopping`), so game code routes all teardown through `KlothoSessionDriver.DetachAndStop` — a re-entrant call is a no-op — rather than carrying its own `_isStopping` flag.
+
+**Reconnect-credentials teardown policy**: `KlothoSession.Stop` / `KlothoSessionDriver.DetachAndStop` / `IKlothoNetworkService.LeaveRoom` all accept `bool keepReconnectCredentials = false`. Default `false` matches a user-intent leave (graceful session end → persisted cold-start credentials are discarded). Process-exit paths (`KlothoSessionDriver.OnDestroy`, game-side `OnApplicationQuit` / `OnDestroy`) must pass `true` so the persisted credentials survive into the next launch — otherwise a normal app quit silently wipes them and the next cold start cannot Reconnect. Explicit cancel / reject paths still clear credentials directly via `IReconnectCredentialsStore.Clear()`.
+
+**NetworkMode**:
+
+| Value | Description |
+| ---- | ---- |
+| `P2P` | Peer-to-peer — all clients hold equal authority (default) |
+| `ServerDriven` | Server-driven — the server collects/verifies inputs, clients only execute |
+
+---
+
+## 3. Prediction and Rollback
+
+### 3.1 Input Prediction Algorithm
+
+**Strategy**: repeat the last input (Temporal Coherence Prediction)
+
+```
+SimpleInputPredictor.PredictInput(playerId, tick, previousCommands):
+│
+├─ search previousCommands for the latest command
+├─ if found:
+│     → reuse the latest command (update tick field)
+└─ else:
+      → return EmptyCommand (cached)
+```
+
+**Accuracy tracking**:
+
+- `_correctPredictions` / `_totalPredictions` counters
+- When real input arrives, accuracy is judged by comparing `CommandTypeId`
+
+### 3.2 Rollback Flow
+
+```
+Real input arrives (OnCommandReceived):
+│
+├─ compare against the predicted input
+├─ if CommandTypeId mismatch:
+│     Rollback(targetTick)
+│     ├─ look up snapshot via RingSnapshotManager.GetNearestSnapshot(targetTick)
+│     │   (ECS: FrameRingBuffer.RestoreFrame)
+│     ├─ Simulation.Rollback(snapshotTick)
+│     ├─ InputBuffer.ClearAfter(snapshotTick)
+│     ├─ re-simulate from snapshotTick → currentTick
+│     └─ raise OnRollbackExecuted(fromTick, snapshotTick)
+│
+└─ else: prediction correct → no rollback needed
+```
+
+### 3.3 Snapshot Management
+
+| Item | Value |
+| ---- | ---- |
+| Save period | Every tick (ExecuteTick, ExecuteTickWithPrediction, and each tick during re-simulation) |
+| Data structure | `RingSnapshotManager` — ring buffer (fixed capacity = MaxRollbackTicks + 2) |
+| Insert / lookup | O(1) |
+| GC | 0 (ring array preallocated) |
+| ECS path | `FrameRingBuffer.SaveFrame(tick, frame)` — Frame.CopyFrom (BlockCopy) |
+| Lookup | `GetNearestSnapshot(tick)` — finds the largest tick ≤ target |
+
+---
+
+## 4. Input System
+
+### 4.1 InputBuffer
+
+**Data structure**:
+
+```
+Dictionary<int, Dictionary<int, ICommand>>
+           │              │         │
+         tick         playerId   command
+```
+
+| Item | Detail |
+| ---- | ---- |
+| Pooling | Inner dictionaries reused via `DictionaryPoolHelper` |
+| Caches | `_commandListCache` (List), `_ticksToRemoveCache` (List) |
+| Range tracking | `_oldestTick`, `_newestTick` |
+
+**Key methods**:
+
+| Method | Complexity | Description |
+| ---- | ---- | ---- |
+| `AddCommand(cmd)` | O(1) | Insert by tick + playerId |
+| `GetCommand(tick, playerId)` | O(1) | Lookup a specific input |
+| `HasCommandForTick(tick)` | O(1) | Whether at least one command exists for the tick |
+| `HasCommandForTick(tick, playerId)` | O(1) | Whether a specific player's command exists |
+| `HasAllCommands(tick, playerCount)` | O(1) | Whether all players' inputs were received |
+| `GetCommandList(tick)` | O(n) | All commands for the tick (cache reused) |
+| `ClearBefore(tick)` | O(k) | Drop old inputs |
+| `ClearAfter(tick)` | O(k) | Drop future inputs on rollback |
+
+### 4.2 Input Delay Compensation
+
+```
+Player input occurs at tick T
+├─ InputDelayTicks = 2
+├─ Command.Tick = CurrentTick + 2
+├─ broadcast over the network
+└─ executed at tick T+2
+
+Effect: gives other players' inputs time to arrive → reduces the need for prediction
+```
+
+---
+
+## 5. Command System
+
+### 5.1 Interface
+
+```
+ICommand:
+  int PlayerId            // issuing player
+  int Tick                // target execution tick
+  int CommandTypeId       // command kind identifier
+  void Serialize(ref SpanWriter writer)
+  void Deserialize(ref SpanReader reader)
+  int GetSerializedSize()
+```
+
+### 5.2 Built-in Command Types
+
+| Type | Location | Purpose |
+| ---- | ---- | ---- |
+| EmptyCommand | Core | Fallback for prediction (cached) |
+| StopCommand | Core | Explicit "no movement, no action" intent. Sent by clients during the `EndGracePolicy.Pause` grace window to deterministically halt all characters; concrete semantics decided by game-side `ICommandSystem` |
+| PlayerJoinCommand | Core | Player-join system command (`ISystemCommand`) |
+| MoveCommand | Gameplay | Move command (TargetX/Y/Z — FP64 raw) |
+| ActionCommand | Gameplay (Sample) | Action command |
+| SkillCommand | Gameplay (Sample) | Skill use |
+
+### 5.3 Command Serialization / Deserialization
+
+- `ICommandFactory.DeserializeCommand(ref SpanReader)` — CommandTypeId-based factory, includes length prefix
+- `ICommandFactory.DeserializeCommandRaw(ref SpanReader)` — raw deserialization without length prefix
+- `SpanWriter/SpanReader`-based — GC-free, ref struct
+
+---
+
+## 6. State Management
+
+### 6.1 IStateSnapshot / IStateSnapshotManager
+
+```csharp
+IStateSnapshot:
+  int    Tick
+  byte[] Serialize()
+  void   Deserialize(byte[])
+  ulong  CalculateHash()
+
+IStateSnapshotManager:
+  void           SaveSnapshot(int tick, IStateSnapshot snapshot)
+  IStateSnapshot GetSnapshot(int tick)
+  bool           HasSnapshot(int tick)
+  void           ClearSnapshotsAfter(int tick)
+  void           ClearAll()
+  IEnumerable<int> SavedTicks
+```
+
+### 6.2 RingSnapshotManager
+
+- Ring-buffer based, fixed capacity = `MaxRollbackTicks + 2`
+- O(1) insert / lookup, GC 0 (preallocated array)
+- `GetNearestSnapshot(tick)` — finds the latest tick ≤ target
+
+---
+
+## 7. ECS
+
+### 7.1 Frame — ECS World State
+
+```csharp
+Frame:
+  int    Tick
+  int    DeltaTimeMs
+  ISimulationEventRaiser   EventRaiser      // injected by the engine each tick (EventCollector)
+  EntityManager            Entities
+  EntityPrototypeRegistry  Prototypes       // not part of CopyFrom — rollback-safe
+  IDataAssetRegistry       AssetRegistry    // global DataAsset lookup (locked after Frame.Add internal layout fixed)
+  Action<EntityRef>        OnEntityCreated / OnEntityDestroyed
+  int    MaxEntities { get; }               // fixed capacity specified at creation
+  ComponentStorage<T>[] (source-generated, single byte[] heap layout)
+
+  // entity lifecycle
+  EntityRef  CreateEntity()
+  EntityRef  CreateEntity(int prototypeId)  // delegates to Prototypes.Create
+  void       DestroyEntity(EntityRef)
+
+  // component access
+  ref T          Get<T>(EntityRef)
+  ref readonly T GetReadOnly<T>(EntityRef)
+  bool           Has<T>(EntityRef)
+  void           Add<T>(EntityRef, T)
+  void           Remove<T>(EntityRef)
+
+  // queries (ref struct, GC 0)
+  Filter<T1..T5>             Filter<T1..T5>()
+  FilterWithout<T1..T5, TEx> FilterWithout<T1..T5, TEx>()
+
+  // hash / snapshot
+  ulong  CalculateHash()    // FNV-1a (Tick + EntityCount + ComponentStorages)
+  void   CopyFrom(Frame)    // restore the entire heap with a single Buffer.BlockCopy
+```
+
+### 7.2 EntityManager
+
+- Generational index + free-list slot reuse
+- Fixed capacity (specified at creation), runtime GC 0
+- `IsAlive(EntityRef)` — verifies Index + Version together to prevent dangling references
+
+### 7.3 ComponentStorage\<T\>
+
+- Sparse-set implementation: `_sparse[entityIndex] → denseIndex`, `_dense[denseIndex] → entityIndex`
+- `unmanaged` constraint — value types only
+- `Add/Remove/Has` O(1); `Remove` uses swap-with-last to keep the dense array contiguous
+- `DenseSpan` / `DenseToSparse` — ReadOnlySpan-based iteration, GC 0
+
+### 7.4 System Interfaces
+
+| Interface | Method | Description |
+| ---- | ---- | ---- |
+| `ISystem` | `Update(ref Frame)` | Per-tick update |
+| `IInitSystem` | `OnInit(ref Frame)` | Initialization |
+| `IDestroySystem` | `OnDestroy(ref Frame)` | Teardown |
+| `ICommandSystem` | `OnCommand(ref Frame, ICommand)` | Command handling |
+| `ISyncEventSystem` | `EmitSyncEvents(ref Frame)` | Emit sync events when a verified tick is finalized |
+| `IEntityCreatedSystem` | `OnEntityCreated(ref Frame, EntityRef)` | Entity-created callback |
+| `IEntityDestroyedSystem` | `OnEntityDestroyed(ref Frame, EntityRef)` | Entity-destroyed callback |
+| `ISignalOnComponentAdded<T>` | `OnAdded(ref Frame, EntityRef, ref T)` | Component-added signal |
+| `ISignalOnComponentRemoved<T>` | `OnRemoved(ref Frame, EntityRef, T)` | Component-removed signal |
+
+**SystemPhase**: `PreUpdate → Update → PostUpdate → LateUpdate` (phase specified at AddSystem; auto-sorted)
+
+### 7.5 EcsSimulation
+
+`ISimulation` implementation.
+
+```csharp
+// constructor
+new EcsSimulation(
+    int maxEntities,
+    int maxRollbackTicks = 10,
+    int deltaTimeMs = 50,
+    ILogger logger = null,
+    IDataAssetRegistryBuilder registryBuilder = null,
+    IDataAssetRegistry assetRegistry = null);
+
+// internal state
+EcsSimulation:
+  Frame           _frame
+  SystemRunner    _systemRunner
+  FrameRingBuffer _ringBuffer    // Frame ring buffer for rollback
+
+  void   Initialize()
+  void   Tick(List<ICommand>)
+  void   Rollback(int targetTick)
+  long   GetStateHash()
+  void   SaveSnapshot()          // calls FrameRingBuffer.SaveFrame
+```
+
+When attached to the engine:
+
+```csharp
+KlothoEngine.Initialize(
+    ISimulation simulation,
+    IKlothoNetworkService networkService,
+    ILogger logger,
+    ISimulationCallbacks simulationCallbacks,
+    IViewCallbacks viewCallbacks = null);
+```
+
+### 7.6 [KlothoComponent(typeId)] Attribute
+
+```csharp
+[KlothoComponent(100)]
+public struct PlayerComponent : IComponent { ... }
+```
+
+- `typeId` 1–99: reserved for the framework; 100+: for game developers
+- The source generator emits `Frame.Components.g.cs` (InitComponentStorages, CopyComponentStorages, etc.)
+
+### 7.7 Entity Prototype System
+
+A pattern for registering an initial entity composition (a combination of components) in code and reusing it via a single ID.
+
+#### Interface
+
+```csharp
+public interface IEntityPrototype
+{
+    void Apply(Frame frame, EntityRef entity);
+}
+```
+
+#### Registry
+
+```csharp
+public class EntityPrototypeRegistry
+{
+    void Register(int prototypeId, IEntityPrototype prototype);  // duplicate ID → InvalidOperationException
+    internal EntityRef Create(int prototypeId, Frame frame);
+}
+```
+
+#### Frame Integration
+
+```csharp
+Frame:
+  EntityPrototypeRegistry Prototypes   // registry (not part of CopyFrom — rollback-safe)
+  EntityRef CreateEntity(int prototypeId)  // overload: delegates to Prototypes.Create
+```
+
+#### Usage
+
+```csharp
+// register (during game initialization)
+frame.Prototypes.Register(1, new PlayerPrototype());
+
+// create (from a system or command handler)
+EntityRef player = frame.CreateEntity(1);
+```
+
+#### Design Principles
+
+| Item | Description |
+| ---- | ---- |
+| Code-only | No editor / asset dependency |
+| GC 0 | `Apply` allocates nothing, only `frame.Add<T>()` |
+| Rollback-safe | `Prototypes` is not copied by `CopyFrom` (immutable registry) |
+| ID collision detection | `Register` throws on duplicate ID |
+
+---
+
+## 8. Deterministic Math
+
+### 8.1 FP64 — 32.32 Fixed-Point
+
+| Item | Value |
+| ---- | ---- |
+| Format | Upper 32 bits: integer part; lower 32 bits: fractional part |
+| Scaling factor (ONE) | `1L << 32` = 4,294,967,296 |
+| Precision (Epsilon) | 2^-32 ≈ 2.33 × 10^-10 |
+| Representable range | ±2,147,483,647.999... (int32 range) |
+| Internal storage | `long _rawValue` (64-bit signed) |
+
+**Constants**:
+
+| Name | Value |
+| ---- | ---- |
+| Zero | 0 |
+| One | 4294967296 |
+| Half | 2147483648 |
+| Pi | 3.14159265358979... (FP64) |
+| TwoPi | 6.28318530717959... (FP64) |
+| HalfPi | 1.57079632679490... (FP64) |
+| Deg2Rad | 0.01745329251994... (FP64) |
+| Rad2Deg | 57.2957795130823... (FP64) |
+| Epsilon | 1 (raw) = 2^-32 |
+
+**Arithmetic**:
+
+| Operation | Implementation |
+| ---- | ---- |
+| Add / Sub | Direct `long` arithmetic |
+| Multiply | Fast path `(a × b) >> 32`; on overflow, Hi/Lo 4-mul decomposition (zero GC) |
+| Divide | Fast path `(a << 32) / b`; on overflow, shift-and-divide (zero GC) |
+| Sqrt | 2-pass binary-restoring square root (64-bit arithmetic only, zero GC) |
+| Compare | Direct `long` comparison |
+
+**Trigonometry**:
+
+| Function | Algorithm | Detail |
+| ---- | ---- | ---- |
+| Sin / Cos | LUT (default) | ~1572 entries, 0.001 rad spacing, linear interpolation, [0, π/2] → quadrant expansion |
+| Sin / Cos | CORDIC (alternative) | 32 iterations, precomputed atan(2^-i) table, K ≈ 1.6467 |
+| Atan2 | CORDIC vectoring | 32 iterations, quadrant handling, special cases (0,0)(0,±)(±,0) |
+| Acos | Composition | `atan2(sqrt(1 - x²), x)` |
+| Tan | Composition | `Sin(a) / Cos(a)` |
+
+**Conversions**:
+
+| Method | Direction |
+| ---- | ---- |
+| `FromInt(int)` | int → FP64 (left-shift 32) |
+| `FromFloat(float)` | float → FP64 (× ONE) |
+| `FromDouble(double)` | double → FP64 (× ONE) |
+| `FromRaw(long)` | raw → FP64 (direct assignment) |
+| `ToInt()` | FP64 → int (right-shift 32) |
+| `ToFloat()` | FP64 → float (÷ ONE) |
+| `ToDouble()` | FP64 → double (÷ ONE) |
+
+### 8.2 FPVector2
+
+```csharp
+public struct FPVector2 : IFixedVector2, IEquatable<FPVector2>
+{
+    public FP64 x, y;
+}
+```
+
+**Static constants**: Zero, One, Up, Down, Left, Right
+
+**Operations**:
+
+| Operation | Description |
+| ---- | ---- |
+| Magnitude | `max * sqrt((x/max)² + (y/max)²)` — scaled by max component to avoid overflow |
+| SqrMagnitude | `x * x + y * y` (FP64 arithmetic) |
+| Normalized | `this / Magnitude` (zero-vector check) |
+| Dot | `(aX·bX + aY·bY) >> 32` |
+| Cross (2D) | `aX·bY - aY·bX` |
+| Distance / SqrDistance | Magnitude of the difference vector |
+| Lerp / MoveTowards | Linear interpolation / max-distance-limited move |
+| Reflect | Reflection vector |
+| Angle / SignedAngle | Angle between two vectors |
+| ClampMagnitude | Clamp magnitude |
+
+### 8.3 FPVector3
+
+```csharp
+public struct FPVector3 : IFixedVector3, IEquatable<FPVector3>
+{
+    public FP64 x, y, z;
+}
+```
+
+**Static constants**: Zero, One, Up, Down, Left, Right, Forward, Back
+
+**Additional operations** (in addition to FPVector2's):
+
+| Operation | Description |
+| ---- | ---- |
+| Cross (3D) | Standard vector cross product |
+| Project / ProjectOnPlane | Vector projection |
+| Scale | Component-wise multiplication |
+| ToXY() / ToXZ() | 2D conversion |
+
+### 8.4 DeterministicRandom
+
+**Algorithm**: Xorshift128+
+
+**Seed initialization** (SplitMix64):
+
+```
+z = seed
+z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
+z = (z ^ (z >> 27)) * 0x94D049BB133111EBUL
+_state0 = z ^ (z >> 31)
+
+z = _state0 + 0x9E3779B97F4A7C15     // golden-ratio constant
+(repeat the same process)
+_state1 = z ^ (z >> 31)
+```
+
+**Xorshift128+ step**:
+
+```
+s1 = _state0;  s0 = _state1;  result = s0 + s1
+_state0 = s0
+s1 ^= s1 << 23
+_state1 = s1 ^ s0 ^ (s1 >> 18) ^ (s0 >> 5)
+return result
+```
+
+**Seeding / state**:
+
+| Method | Purpose |
+| ---- | ---- |
+| `new DeterministicRandom(int seed)` / `SetSeed(int seed)` | Initialize / reseed from an int seed (`Seed` property reads it back). |
+| `FromSeed(ulong worldSeed, ulong featureKey, ulong index = 0)` | Derive an independent stream per feature from a shared world seed. |
+| `SetFullState(ulong state0, ulong state1)` | Restore exact internal state (snapshot / rollback / resync). |
+
+**Distribution methods**:
+
+| Method | Returns | Algorithm |
+| ---- | ---- | ---- |
+| `NextInt()` | 0 ~ 2^31-1 | `NextUInt64() & 0x7FFFFFFF` |
+| `NextInt(min, max)` | [min, max) | Modular arithmetic |
+| `NextIntInclusive(min, max)` | [min, max] | Modular arithmetic |
+| `NextFixed()` | [0, 1) FP64 | `NextUInt64() & 0xFFFFFFFF` → fixed-point |
+| `NextFixed(min, max)` | [min, max) FP64 | Scaled `NextFixed()` |
+| `NextFixedInclusive()` / `NextFixedInclusive(min, max)` | [0, 1] / [min, max] FP64 | Inclusive-bound variants |
+| `NextBool()` | true/false | LSB check |
+| `NextChance(percent)` | bool | Percentage chance |
+| `NextWeighted(int[] weights)` | int (index) | Weighted selection |
+| `NextInsideUnitCircle()` | FPVector2 | [-1,1]² rejection sampling |
+| `NextInsideUnitSphere()` | FPVector3 | [-1,1]³ rejection sampling |
+| `NextDirection2D()` | FPVector2 | Uniform angle: `NextFixed() * TwoPi` |
+| `NextDirection3D()` | FPVector3 | Uniform spherical distribution (θ, z parameters) |
+| `NextRotation()` | FPQuaternion | Uniform random orientation |
+| `Shuffle<T>(array)` | void | Fisher-Yates shuffle |
+
+---
+
+## 9. Network
+
+### 9.1 Transport Abstraction
+
+```
+INetworkTransport:
+  Connect(address, port)
+  Disconnect()
+  Send(peerId, data, deliveryMethod)
+  Broadcast(data, deliveryMethod)
+  PollEvents()
+
+  OnDataReceived:       Action<int, byte[]>    (peerId, data)
+  OnPeerConnected:      Action<int>            (peerId)
+  OnPeerDisconnected:   Action<int>            (peerId)
+  OnConnected:          Action
+  OnDisconnected:       Action
+```
+
+**DeliveryMethod**:
+
+| Mode | Ordered | Reliable |
+| ---- | ---- | ---- |
+| Unreliable | X | X |
+| Reliable | X | O |
+| ReliableOrdered | O | O |
+| Sequenced | O | X (drops stale packets) |
+
+### 9.2 Message Types (`NetworkMessageType : byte`)
+
+| Type | ID | Purpose |
+| ---- | ---- | ---- |
+| **Room** | | |
+| RoomHandshake | 1 | Handshake for multi-room server routing |
+| JoinRoom | 10 | Join a room |
+| LeaveRoom | 11 | Leave a room |
+| PlayerReady | 12 | Player ready state |
+| GameStart | 13 | Game start + config delivery |
+| PlayerJoin | 14 | Player-join notification. Carries the optional lobby `Ticket` (opaque base64url credential) and an unverified `ClaimedDisplayName` (no-lobby nickname) — see Player Identity Handoff (§9.6) |
+| JoinReject | 15 | Room-join rejection. `Reason` is a wire byte: room codes 1~5, identity codes 6~11 — distinct from the client-local `JoinFailReason` enum (mapped by `FromJoinReject`); see §9.6 |
+| **Command** | | |
+| Command | 20 | Player input command |
+| CommandAck | 21 | Command receipt ack |
+| CommandRequest | 22 | Re-request a missing command |
+| ReliableCommandSubmit | 23 | Reliable command submit (`IReliableCommand`) — client→authority, tick-less; the authority assigns the execution tick. ServerDriven path; P2P uses the legacy path (see API §3.4) |
+| **Sync** | | |
+| SyncHash | 30 | State-hash sync verification |
+| SyncHashAck | 31 | SyncHash receipt ack |
+| FullState | 32 | Full state transmission |
+| FullStateRequest | 33 | Request full state |
+| **Connection** | | |
+| Ping | 40 | Latency measurement |
+| Pong | 41 | Ping response |
+| Disconnect | 42 | Disconnect |
+| **Handshake** | | |
+| SyncRequest | 50 | Sync request |
+| SyncReply | 51 | Sync reply |
+| SyncComplete | 52 | Sync complete |
+| **Spectator** | | |
+| SpectatorJoin | 60 | Spectator join request |
+| SpectatorAccept | 61 | Spectator join accept |
+| SpectatorInput | 62 | Verified inputs delivered to spectator |
+| SpectatorLeave | 63 | Spectator leave |
+| **Reconnect / Late Join** | | |
+| ReconnectRequest | 70 | Reconnect request |
+| ReconnectAccept | 71 | Reconnect accept |
+| ReconnectReject | 72 | Reconnect reject |
+| LateJoinAccept | 73 | Late-join accept |
+| RecommendedExtraDelayUpdate | 74 | Dynamic InputDelay push (server → client) when smoothed RTT change crosses the asymmetric UP/DOWN threshold. Seed value also carried inline on SyncComplete / LateJoinAccept / ReconnectAccept |
+| LateJoinNotification | 75 | Host (P2P) / server (SD) → existing peers and spectators when a late-joiner is admitted. Recipients update their player list (`OnPlayerJoined` / `PlayerCount`) so mid-match joins propagate without a poll. Forged-sender guards: P2P rejects when `IsHost` is true; SD rejects when `peerId != 0`. Idempotent — duplicate notifications for the same player are dropped against the local roster |
+| **Server-Driven Mode** | | |
+| ClientInput | 80 | Client → server input |
+| VerifiedState | 81 | Server → client verified state |
+| InputAck | 82 | Server's input-receipt ack |
+| ClientInputBundle | 83 | Bundled input transmission |
+| PlayerBootstrapReady | 84 | Client → server: bootstrap completed (player ready) — bootstrap handshake |
+| BootstrapBegin | 85 | Server → client: open bootstrap window (FirstTick, TickStartTimeMs) |
+| CommandRejected | 86 | Server → client unicast on input rejection (tick, cmdTypeId, RejectionReason). Surfaces as engine `OnCommandRejected` (§2.3) on the originating client |
+| **Config Layer** | | |
+| SimulationConfig | 90 | Simulation-parameter payload |
+| PlayerConfig | 91 | Per-player config payload |
+| **User-Defined Reservation** | | |
+| UserDefined_Start | 200 | Values beyond this can be cast and used freely by sample/game code (prevents inverting Runtime enum dependency direction) |
+
+### 9.3 Message Serialization
+
+All messages use `SpanWriter/SpanReader`-based GC-free serialization.
+The first byte is the `NetworkMessageType` value.
+
+**CommandMessage** (ID=20):
+
+```text
+[byte 20] [int Tick] [int PlayerId] [int SenderTick] [int DataLength] [byte[] CommandData]
+```
+
+**SyncHashMessage** (ID=30):
+
+```text
+[byte 30] [int Tick] [long Hash] [int PlayerId]
+```
+
+**GameStartMessage** (ID=13):
+
+Carries the SessionConfig payload + StartTime + PlayerIds together (a separated SessionConfig propagation path).
+
+```text
+[byte 13]
+  [long StartTime]                    // absolute game-start time, in SharedNow
+  [int  RandomSeed]
+  [int  MaxPlayers]
+  [int  MaxSpectators]
+  [int  MinPlayers]
+  [bool AllowLateJoin]
+  [int  ReconnectTimeoutMs]
+  [int  ReconnectMaxRetries]
+  [int  LateJoinDelayTicks]
+  [int  ResyncMaxRetries]
+  [int  DesyncThresholdForResync]
+  [int  CorrectiveResetCooldownMs]
+  [int  CountdownDurationMs]
+  [int  CatchupMaxTicksPerFrame]
+  [int  AbortGraceMs]
+  [int  EndGracePolicy]               // EndGracePolicy enum (Continue/Pause)
+  [int  EndGraceMs]
+  [int  ClientShutdownGraceMs]
+  [int  PlayerIdCount] [int[] PlayerIds]
+```
+
+The same SessionConfig payload is also propagated via `LateJoinAcceptMessage` and `ReconnectAcceptMessage` so a joiner ends up with byte-identical session parameters regardless of the join path.
+
+**Ping/Pong** (ID=40/41):
+
+```text
+[byte 40|41] [long Timestamp] [int Sequence]
+```
+
+### 9.4 Desync Detection
+
+```text
+Every SyncCheckInterval (20 ticks):
+├─ compute local state hash (ISimulation.GetStateHash → FNV-1a 64-bit)
+├─ _localHashes[tick] = hash
+├─ broadcast SyncHashMessage (Unreliable)
+├─ on remote-hash receipt, compare
+└─ on mismatch → raise OnDesyncDetected(localHash, remoteHash)
+```
+
+### 9.4.1 Hash Gate (post-`ApplyFullState`)
+
+```text
+ApplyFullState(tick, data, hash, ApplyReason):
+├─ restore from data
+├─ localHash = ISimulation.GetStateHash()
+├─ compare localHash vs advertised stateHash
+└─ on mismatch → raise OnHashMismatch(tick, localHash, remoteHash)
+```
+
+The hash gate fires on every `ApplyFullState` entry point (`LateJoin` / `InitialFullState` / `ResyncRequest` / `CorrectiveReset` / `Reconnect`). In P2P, `OnHashMismatch` is wired to `HandleHashMismatchForCorrectiveReset` → `TryCorrectiveReset` (host-only). In SD / Spectator the event still fires but the corrective path is a no-op (host-only guard).
+
+### 9.4.2 Corrective Reset (P2P, host-only)
+
+```text
+OnHashMismatch (host) ─► HandleHashMismatchForCorrectiveReset
+                          └─► TryCorrectiveReset(divergenceTick):
+                                ├─ if (!IsHost) return
+                                ├─ if (now - _lastCorrectiveResetMs < CorrectiveResetCooldownMs) return
+                                ├─ serialize current state (cached if same tick)
+                                ├─ BroadcastFullState(CurrentTick, data, hash, FullStateKind.CorrectiveReset)
+                                └─ host self-apply (host does not receive its own broadcast)
+
+ApplyFullState (ApplyReason.CorrectiveReset):
+└─ on successful hash match → raise OnMatchReset(ResetReason.StateDivergence)
+```
+
+The cooldown (`CorrectiveResetCooldownMs`, default 5000ms) prevents broadcast storms under persistent divergence. Guests receive `FullStateKind.CorrectiveReset` via `OnFullStateReceived` and apply with `ApplyReason.CorrectiveReset` (retreat allowed). `OnMatchReset` only fires when the post-restore hash matches the broadcast hash — on mismatch, the mid-match desync pipeline retries.
+
+### 9.4.3 Chain Stall Watchdog (peer-local)
+
+```text
+Every Update():
+└─ CheckChainStallTimeout():
+     ├─ if (Phase != Playing || engine ended) return
+     ├─ lag = CurrentTick - LastVerifiedTick
+     ├─ threshold = max(SessionConfig.ReconnectTimeoutMs / TickIntervalMs + 100, SimulationConfig.MinStallAbortTicks)
+     ├─ if (lag < threshold) return
+     └─ AbortMatch(AbortReason.ChainStallTimeout) → state = Aborted, OnMatchAborted raised
+```
+
+Both host and guest peers run the watchdog locally — either can self-abort when its verified chain stalls past the threshold. Distinct from `Finished` so abort-handling UI (replay save / score aggregation) can branch via `KlothoStateExtensions.IsEnded()`.
+
+### 9.5 IKlothoNetworkService Events
+
+| Event | Signature | Description |
+| ---- | ---- | ---- |
+| OnGameStart | `Action` | Game start |
+| OnCountdownStarted | `Action<long>` | Countdown started (startTime) |
+| OnPlayerJoined | `Action<IPlayerInfo>` | Player joined |
+| OnPlayerLeft | `Action<IPlayerInfo>` | Player left |
+| OnCommandReceived | `Action<ICommand>` | Command received |
+| OnDesyncDetected | `Action<int, int, long, long>` | Desync detected (playerId, tick, localHash, remoteHash) |
+| OnFrameAdvantageReceived | `Action<int, int>` | Remote frame-advantage received (peerId, advantageTicks) |
+| OnLocalPlayerIdAssigned | `Action<int>` | Local player ID assignment completed |
+| OnFullStateRequested | `Action<int, int>` | Full-state request received (peerId, requestTick) |
+| OnFullStateReceived | `Action<int, byte[], long, FullStateKind>` | Full state received (tick, data, hash, kind). `kind` distinguishes `Unicast` (resync / late-join reply), `CorrectiveReset` (P2P host-broadcast on hash divergence), `InitialState` (SD session-start broadcast) |
+| OnPlayerDisconnected | `Action<IPlayerInfo>` | Player disconnected (awaiting reconnect) |
+| OnPlayerReconnected | `Action<IPlayerInfo>` | Player reconnected (Host) |
+| OnReconnecting | `Action` | Reconnect in progress (Guest) |
+| OnReconnectFailed | `Action<byte>` | Reconnect failed (Guest). The byte is a `ReconnectRejectReason` value (`InvalidMagic`, `InvalidPlayer`, `TimedOut`, `AlreadyConnected`, `DeviceMismatch`, `TransportStartFailed`, `MaxRetries`, `Unknown`). Use `ReconnectRejectReason.ToName(reason)` for a symbolic name, `ReconnectRejectReason.RequiresUserChoice(reason)` to detect `AlreadyConnected`. Cold-start paths surface the same reason via `ReconnectFailedException.Reason` |
+| OnReconnected | `Action` | Reconnect completed (Guest) |
+| OnLateJoinPlayerAdded | `Action<int, int>` | Late-join player added (playerId, joinTick) |
+| OnPhaseChanged | `Action<SessionPhase>` | Session phase transitioned (`Lobby → Countdown → Running → Ended`). Surfaced to the game as `IKlothoSessionObserver.OnPhaseChanged` so game code does not poll the service each frame |
+| OnPlayerCountChanged | `Action<int>` | Active player count changed (joins, leaves, late-joins). Surfaced to the game as `IKlothoSessionObserver.OnPlayerCountChanged`. `ISpectatorService.OnPlayerCountChanged` is the parallel surface for spectator sessions; the session forwards either source to the same observer callback |
+| OnAllPlayersReadyChanged | `Action<bool>` | All-players-ready gate flipped (true when every active player has ready-signaled; false on subsequent join). Surfaced to the game as `IKlothoSessionObserver.OnAllPlayersReadyChanged` |
+
+`IPlayerInfo` (the argument to the player events above) exposes `PlayerId`, `DisplayName`, `Account`, `IsReady`, `Ping`, `ConnectionState`. `DisplayName` / `Account` are the authoritative identity — see Player Identity Handoff (§9.6).
+
+### 9.6 Extended Network Subsystems
+
+#### Spectator System
+
+A spectator receives only verified state without input and reproduces the simulation without synchronization.
+
+```
+SpectatorJoin(60) ──► host
+host ──► SpectatorAccept(61) [SimulationConfig + SessionConfig + SpectatorStartInfo (FullState + startTick + tickInterval)]
+Every SPECTATOR_INPUT_INTERVAL ticks:
+  host ──► SpectatorInput(62) [startTick, tickCount, verified input batch]
+```
+
+- `ISpectatorService / SpectatorService` — manages spectator-side connection and input receipt
+- `SpectatorService.OnSimulationConfigReceived` / `OnSessionConfigReceived` — fired on Accept receipt. The spectator client creates Engine/Simulation with the server-authoritative values only after both events arrive (deferred-Engine-creation pattern).
+- `SpectatorService.SetEngine(engine)` — deferred-Engine injection API used in the pattern above
+- `engine.StartSpectator(SpectatorStartInfo)` — start the engine in spectator mode
+- `engine.IsSpectatorMode` — whether spectator mode is active (prediction/rollback disabled)
+- Capacity gate — spectator admission is bounded by `SessionConfig.MaxSpectators`, exposed at the network layer as `ServerNetworkService.MaxSpectatorsPerRoom`. The transport listen capacity is `MaxPlayersPerRoom + MaxSpectatorsPerRoom`, and `RoomRouter` keeps the player capacity gate independent of the spectator slots.
+
+#### Reconnect Protocol
+
+A player disconnected during Playing can reconnect.
+
+```
+Guest ──► ReconnectRequest(70)
+Host  ──► ReconnectAccept(71) + FullState
+       or ReconnectReject(72) (timeout / session expired)
+```
+
+While awaiting reconnect, the host fills that player's input with empty commands (`OnDisconnectedInputNeeded`).
+
+#### Late Join Protocol
+
+When `AllowLateJoin = true`, a player can join an in-progress game.
+
+```
+Guest ──► JoinRoom(10) → after handshake completes
+Host  ──► FullState(32) + the command stream so far
+Guest: enters CatchingUp state, catches up at up to CatchupMaxTicksPerFrame ticks/frame
+On catchup completion → OnCatchupComplete → IViewCallbacks.OnLateJoinActivated
+```
+
+#### Server-Driven Mode
+
+Under `NetworkMode.ServerDriven`, the server holds input authority.
+
+```
+Client ──► ClientInput(80) / ClientInputBundle(83)
+Server ──► InputAck(82) + VerifiedState(81) [confirmed state/hash included]
+```
+
+- `ServerNetworkService` — server side: input collection, frame verification, state broadcast
+- `ServerDrivenClientService` — client side: input transmission, server-state receipt
+- `Room / RoomManager / RoomRouter` — multi-room: a single server managing multiple independent game sessions
+
+#### Player Identity Handoff
+
+Carries a lobby-issued credential into the session, validates it at the trust boundary, and propagates the authoritative identity to every peer. Fully **opt-in**: with no provider/validator configured the path is inert and behavior is unchanged (no-lobby / LAN / prototype). The core only **carries, hooks, and propagates** — ticket signing, lobby redeem, and crypto live in the Game Service Layer (reference implementations under `Samples/IdentityP2pRef` / `Samples/IdentitySdRef`), per the layer separation (§Network Layer Separation).
+
+Identity surface on `IPlayerInfo`: `Account` (stable id, invariant across sessions) and `DisplayName` (authoritative display name) — both default to `""` when no lobby is present, and are distinct from `DeviceId` (reconnect fingerprint; never interchanged).
+
+**Carriage** — `PlayerJoinMessage` (14):
+- `Ticket` — opaque base64url credential (the core never parses it), presented to the host (P2P) / server (SD).
+- `ClaimedDisplayName` — unverified client-claimed nickname; adopted **only when no validator is present** (LAN/dev). A validator always ignores it (spoof-proof); `Account` is never claimable.
+
+**Validation hook** — `IPlayerIdentityValidator.BeginValidate(in IdentityValidationRequest)` is invoked at `CompletePeerSync`, **before** slot reservation (a reject consumes no slot). It returns an `IIdentityValidation` handle the core polls per tick (`IsComplete` → `Outcome`), so an online redeem runs off the network loop without blocking it.
+
+- **SD (online)** — local first-pass (signature + expiry) rejects obvious forgeries, then a lobby `redeem` round-trip is the authority (nonce consume, real-time ban, match binding).
+- **P2P (offline)** — the host verifies the lobby signature + expiry + `sessionId` + a session-scoped nonce; guests trust the host's verdict (**semi-trust**: the host is the single verifier and the original ticket is not propagated).
+- **Host self** — the host validates its own ticket; a host-self reject downgrades to the `"Host"` fallback (the host cannot kick itself).
+
+`IdentityValidationOutcome.Accept(account, displayName)` overlays the authoritative identity; `Reject(wireCode)` sends `JoinReject` then disconnects.
+
+**Reject reason codes** — the disconnect-payload **wire byte** and the client-local `JoinFailReason` enum are **distinct numbering schemes**, mapped by `JoinFailReason.FromJoinReject`:
+
+| Meaning | Wire byte | `JoinFailReason` enum |
+| ---- | ---- | ---- |
+| (room reasons) | 1~5 | 7~11 |
+| IdentityInvalid (bad signature / format / empty-or-oversize account) | 6 | 12 |
+| IdentityExpired | 7 | 13 |
+| IdentitySessionMismatch (cross-match / wrong room) | 8 | 14 |
+| IdentityRejected (redeem deny / ban / consumed nonce) | 9 | 15 |
+| IdentityRequired (validator present, no ticket) | 10 | 16 |
+| IdentityValidationFailed (transport fault / redeem timeout) | 11 | 17 |
+| unmapped | 0 / other | Unknown |
+
+A redeem-returned code outside 6~11 is clamped to 9 (`IdentityRejected`) — a trust boundary so a buggy lobby cannot make the client misread the disconnect as a retryable room reason.
+
+**Propagation** — the authoritative `Account` / `DisplayName` ride the existing roster path as a unified `RosterEntry` (`PlayerId / ConnectionState / ReadyState / Account / DisplayName`), which **replaces** the former index-parallel lists on `SyncComplete` (52), `LateJoinAccept` (73), `ReconnectAccept` (71), `SpectatorAccept` (61) and the in-memory `ConnectionResult`. Per-join notifications `PlayerJoinNotification` / `LateJoinNotification` (75) carry scalar `Account` / `DisplayName`. The name fields are encoded as `FixedString64` (62 UTF-8 bytes); a longer value is truncated at a char boundary by `RosterEntry.ToFixedName` with a build warning + dev assert (not expected — the validators reject an empty or >62-byte account at the source).
+
+**Reconnect** — identity is **not** re-validated on reconnect (the nonce is one-time and the ticket may have expired). The authority caches `{account, displayName}` keyed by session slot at first validation and restores it after the reconnect auth gate (`SessionMagic`) passes; the cache is evicted at session end.
+
+**Lobby protocol (Game Service Layer, recommended)** — the core does not implement this; the reference validators follow it:
+
+```
+issueTicket  (lobby → client, on login / match):  req {authToken, matchId} → res {ticket, endpoint, roomId, mode}
+redeemTicket (SD server → lobby):                 req {ticket, sessionId, serverId, roomId}
+                                                  → res {ok, account, displayName} | {ok:false, reason}
+```
+
+- Ticket = signed payload `{account, displayName, sessionId, issuedAt, expiresAt, nonce}` + signature (Ed25519; the lobby public key is distributed to clients/servers). `issuedAt` is carried but not checked — the operative time bound is `expiresAt > now`.
+- SD redeem is authoritative: the nonce is consumed with an **idempotency window** (a repeat within the window returns the cached result, so a player who passed validation but dropped before slot reservation recovers on rejoin; beyond the window it is a replay reject). Match binding uses the ticket's own `sessionId` as authority (the `sessionId` arg is a cross-check hint); the lobby rejects a match not assigned to the redeeming `serverId`.
+- **roomId trust (SD multi-room)** — on a server hosting several rooms, `roomId` is a **client-asserted routing hint** (carried in `RoomHandshakeMessage`, sent pre-join with no access control — a client can route to any in-range room, and an unknown one is lazily created), **not** an authority. Trust comes from the signed `sessionId` being bound to a `(serverId, roomId)` in the lobby's assignment ledger: the validator carries the *routed* room (`IdentityValidationRequest.RoomId`) into the redeem, and the lobby cross-checks it against the bound room — a mismatch is `IdentitySessionMismatch` (wire 8), with **no slot consumed** (the hook runs before slot reservation). The binding is **per match** (`sessionId` = matchId; all players of a match share one room). Single-room SD binds to room `0`; P2P is not multi-room and passes a `-1` sentinel the validator ignores (the `roomId` field is append-only opt-in — a validator that does not read it is unaffected).
+- P2P uses signature verification only (offline, no network) — no real-time ban, so a short `expiresAt` is recommended.
+
+**Builder** — guest `WithLobbyIdentity(IPlayerIdentityProvider)` supplies the ticket via `GetTicket()`; host/server `WithIdentityValidator(IPlayerIdentityValidator)`. These are independent opt-in features (no hard inter-dependency); `Build()` emits an advisory when a validator has no host/server entry point or a provider has no guest entry point.
+
+---
+
+## 10. Replay System
+
+### 10.1 States
+
+```
+Idle → Recording → (Stopped) → Idle
+Idle → Playing → Paused → Playing
+                         → Finished → Idle
+```
+
+| State | Description |
+| ---- | ---- |
+| Idle | Inactive |
+| Recording | Recording in progress |
+| Playing | Playback in progress |
+| Paused | Playback paused |
+| Finished | Playback finished |
+
+### 10.2 ReplayData File Format
+
+The file is stored uncompressed, self-framed by the leading 4 bytes `RPLY` magic; the loader (`ReplaySystem`) requires it.
+
+- **Format**: leading 4 bytes `RPLY` (0x52504C59) followed by the payload below
+
+Payload:
+
+```
+┌──────────────────────────────────────┐
+│ uint   MagicNumber = 0x52504C59      │  "RPLY" (uncompressed path only)
+├──────────────────────────────────────┤
+│ Metadata:                            │
+│   int    Version (currently 1)       │
+│   string SessionId (GUID)            │
+│   long   RecordedAt (DateTime ticks) │
+│   long   DurationMs                  │
+│   int    TotalTicks                  │
+│   int    PlayerCount                 │
+│   int    TickIntervalMs              │
+│   int    RandomSeed                  │
+├──────────────────────────────────────┤
+│ int TickCount                        │
+│ for each tick:                       │
+│   int Tick                           │
+│   int CommandCount                   │
+│   for each command:                  │
+│     int    CommandDataLength         │
+│     byte[] CommandData               │
+└──────────────────────────────────────┘
+```
+
+### 10.3 Playback Features
+
+| Feature | Method |
+| ---- | ---- |
+| Play / pause / resume / stop | `Play()`, `Pause()`, `Resume()`, `Stop()` |
+| Seek by tick | `SeekToTick(int tick)` |
+| Seek by progress | `SeekToProgress(float 0~1)` |
+| Step forward/backward by frame | `StepForward()`, `StepBackward()` |
+| Progress query | `Progress` (0.0 ~ 1.0) |
+
+**Playback speed** (`ReplaySpeed` enum, value = multiplier × 100):
+
+| Speed | Multiplier | Enum Value |
+| ---- | ---- | ---- |
+| Quarter | 0.25x | 25 |
+| Half | 0.5x | 50 |
+| Normal | 1.0x | 100 |
+| Double | 2.0x | 200 |
+| Quadruple | 4.0x | 400 |
+
+### 10.4 Events
+
+| Event | Signature |
+| ---- | ---- |
+| OnTickPlayed | `Action<int, IReadOnlyList<ICommand>>` |
+| OnPlaybackFinished | `Action` |
+| OnSeekCompleted | `Action<int>` |
+| OnRecordingStarted | `Action` |
+| OnRecordingStopped | `Action<IReplayData>` |
+
+---
+
+## 11. GC Optimization Strategies
+
+### 11.1 Object Pooling
+
+| Pool | Target | Used By |
+| ---- | ---- | ---- |
+| `DictionaryPoolHelper` | `Dictionary<int, T>` | InputBuffer's inner dictionaries |
+| `ListPool` | `List<T>` | Command lists, etc. |
+| `StreamPool` | `MemoryStream` | Serialization (using pattern) |
+
+### 11.2 Cached Fields
+
+| Location | Field | Purpose |
+| ---- | ---- | ---- |
+| KlothoEngine | `_tickCommandsCache` | Per-tick command collection |
+| KlothoEngine | `_previousCommandsCache` | Previous-command collection for prediction |
+| KlothoEngine | `_hashKeysToRemoveCache` | Hash-cleanup key collection |
+| InputBuffer | `_commandListCache` | GetCommandList return value |
+| InputBuffer | `_ticksToRemoveCache` | Removal keys for ClearBefore/After |
+| SimpleInputPredictor | `EmptyCommand` (cached) | Empty-command reuse |
+
+### 11.3 Coding Rules
+
+- No LINQ — manual `for` loops
+- Avoid lambda / closure captures
+- ECS Filter — `ref struct`-based, no heap allocation
+- `SpanWriter/SpanReader` — ref-struct serialization minimizes array allocation
+
+---
+
+## 12. Precision and Range Summary
+
+| Component | Type | Precision | Range |
+| ---- | ---- | ---- | ---- |
+| FP64 | 32.32 fixed-point | 2^-32 ≈ 2.33 × 10^-10 | ±2,147,483,647.999 |
+| Position / velocity | FPVector3 (FP64 × 3) | same | same |
+| Rotation | FP64 (degrees) | same | same |
+| State hash | ulong (FNV-1a) | 64-bit | 0 ~ 2^64-1 |
+| Timestamp | long | 1 DateTime tick | .NET DateTime range |
+| Random seed | int | 32-bit | -2^31 ~ 2^31-1 |
+| Tick interval | int (ms) | 1 ms | 1 ~ ∞ |
+
+---
+
+*Last updated: 2026-06-18 — ReliableCommandSubmit=23, IReliableCommand authoritative placement*

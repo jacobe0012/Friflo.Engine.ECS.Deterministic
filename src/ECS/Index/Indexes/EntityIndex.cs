@@ -47,6 +47,9 @@ internal abstract class EntityIndex : GenericComponentIndex<Entity>
         EntityIndexUtils.RemoveComponentValue (id, target, this);
     }
     
+    /// <summary> Used by the deterministic rollback bridge. See DeterministicAccess.cs. </summary>
+    internal override void ClearIndex() => entityMap.Clear();
+    
     internal void RemoveLinksWithTarget(int targetId)
     {
         entityMap.TryGetValue(targetId, out var idArray);

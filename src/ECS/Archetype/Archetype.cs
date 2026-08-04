@@ -30,7 +30,7 @@ namespace Friflo.Engine.ECS;
 /// <br/>
 /// Queries can be created via generic <see cref="EntityStoreBase"/>.<c>Query()</c> methods.<br/>
 /// </remarks>
-public sealed class Archetype
+public sealed partial class Archetype
 {
 #region     public properties
     /// <summary>Number of entities / components stored in the <see cref="Archetype"/></summary>

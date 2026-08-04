@@ -1,0 +1,49 @@
+<!--
+  Klotho.Runtime — engine-agnostic Klotho core (ECS, Serialization, Network, Core, Replay,
+  Deterministic math/physics, Diagnostics), mirroring the upstream Server~ assembly boundaries.
+
+  Excludes (each is engine/json-coupled or a separate upstream assembly):
+    **/Json/**   DataAsset.Json subtree (Unity/json-coupled)
+    Plugins/**   optional MEL logging adapter (needs Microsoft.Extensions.Logging)
+
+  Unlike upstream, Logging / Gameplay / LiteNetLib / ThirdParty are compiled into this single
+  assembly instead of separate ones: the bridge only needs one reference, and KlothoGenerator
+  emits its registrations in the assembly holding CommandFactory/MessageSerializer.
+-->
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <!-- Klotho uses unsafe in LowLevel/KUnsafe + LiteNetLib. Scoped to this assembly:
+         Friflo.Engine.ECS keeps AllowUnsafeBlocks=false. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <AssemblyName>Klotho.Runtime</AssemblyName>
+    <RootNamespace>xpTURN.Klotho</RootNamespace>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <IsPackable>false</IsPackable>
+    <!-- Third-party source: do not fail this build on its warnings. -->
+    <NoWarn>$(NoWarn);CS0169;CS0414;CS0649;CS1591;CS8632</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+  </ItemGroup>
+
+  <!-- Source generator (prebuilt DLL shipped with the Klotho package). -->
+  <ItemGroup>
+    <Analyzer Include="$(MSBuildThisFileDirectory)..\Analyzers\KlothoGenerator.dll" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The intermediate/output dirs live under this folder and hold generated .cs
+         (AssemblyInfo etc.), so they must be excluded or their attributes are compiled twice. -->
+    <Compile Include="$(MSBuildThisFileDirectory)**\*.cs"
+             Exclude="$(MSBuildThisFileDirectory)**\Json\**\*.cs;
+                      $(MSBuildThisFileDirectory)Plugins\**\*.cs;
+                      $(MSBuildThisFileDirectory).obj\**\*.cs;
+                      $(MSBuildThisFileDirectory)bin\**\*.cs" />
+  </ItemGroup>
+
+</Project>

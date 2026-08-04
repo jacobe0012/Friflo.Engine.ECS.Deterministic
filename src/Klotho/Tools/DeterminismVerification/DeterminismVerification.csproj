@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RootNamespace>xpTURN.Klotho.DeterminismVerification</RootNamespace>
+    <Nullable>disable</Nullable>
+  </PropertyGroup>
+
+  <!-- Klotho engine-agnostic assemblies (mirror the client asmdef structure).
+       Determinism verification needs only the deterministic core + logging; it does no
+       networking, so Gameplay/transport (and KlothoServer) are intentionally not referenced. -->
+  <ItemGroup>
+    <ProjectReference Include="..\..\com.xpturn.klotho\Server~\xpTURN.Klotho.Runtime\xpTURN.Klotho.Runtime.csproj" />
+    <ProjectReference Include="..\..\com.xpturn.klotho\Server~\xpTURN.Klotho.Logging\xpTURN.Klotho.Logging.csproj" />
+  </ItemGroup>
+
+  <!-- Source Generator (KlothoGenerator, built from source) for the verification-specific
+       components/commands compiled into this exe. -->
+  <ItemGroup>
+    <ProjectReference Include="..\KlothoGenerator\KlothoGenerator.csproj"
+                      OutputItemType="Analyzer"
+                      ReferenceOutputAssembly="false" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <VerificationRoot>..\..\Samples\Brawler\Assets\Tests\DeterminismVerification</VerificationRoot>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Verification code (components, systems, commands, HashDumpWriter).
+         DeterminismVerificationRunner.cs excluded (Unity MonoBehaviour). -->
+    <Compile Include="$(VerificationRoot)\Components\*.cs" Link="Verification\Components\%(Filename)%(Extension)" />
+    <Compile Include="$(VerificationRoot)\Systems\*.cs" Link="Verification\Systems\%(Filename)%(Extension)" />
+    <Compile Include="$(VerificationRoot)\Commands\*.cs" Link="Verification\Commands\%(Filename)%(Extension)" />
+    <Compile Include="$(VerificationRoot)\HashDumpWriter.cs" Link="Verification\HashDumpWriter.cs" />
+  </ItemGroup>
+</Project>

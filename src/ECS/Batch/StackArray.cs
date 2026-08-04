@@ -7,7 +7,7 @@ using System;
 // ReSharper disable once CheckNamespace
 namespace Friflo.Engine.ECS;
 
-internal struct StackArray<T>
+internal partial struct StackArray<T>
 {
 #region properties
     internal        int     Count       => count;

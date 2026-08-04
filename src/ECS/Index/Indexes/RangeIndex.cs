@@ -56,6 +56,9 @@ public sealed class RangeIndex<TIndexedComponent,TValue> : GenericComponentIndex
         SortedListUtils.RemoveComponentValue (id, value, entityMap, this);
     }
     
+    /// <summary> Used by the deterministic rollback bridge. See DeterministicAccess.cs. </summary>
+    internal override void ClearIndex() => entityMap.Clear();
+    
     internal override void RemoveEntityFromIndex(int id, Archetype archetype, int compIndex)
     {
         var map         = entityMap;

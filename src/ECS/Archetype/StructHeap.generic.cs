@@ -18,7 +18,7 @@ namespace Friflo.Engine.ECS;
 /// - to enable maximum efficiency when GC iterate <see cref="Archetype.structHeaps"/> <see cref="Archetype.heapMap"/>
 ///   for collection.
 /// </remarks>
-internal sealed class StructHeap<T> : StructHeap, IComponentStash<T>
+internal sealed partial class StructHeap<T> : StructHeap, IComponentStash<T>
     where T : struct
 {
     /// <summary>

@@ -15,7 +15,7 @@ namespace Friflo.Engine.ECS.Relations;
 
 internal delegate AbstractEntityRelations CreateEntityRelations(ComponentType componentType, Archetype archetype, StructHeap heap);
 
-internal abstract class AbstractEntityRelations
+internal abstract partial class AbstractEntityRelations
 {
     internal            int                         version;
     internal            int                         Count       => archetype.Count;

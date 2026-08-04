@@ -1,0 +1,26 @@
+<!--
+  Klotho.Friflo.Bridge — adapts a Friflo EntityStore to Klotho's ISimulation so Friflo game
+  code (EntityStore / SystemRoot / Query) can run under Klotho's rollback / lockstep engine.
+
+  Needs Friflo internals (StructHeap<T>.components, EntityStore.nodes, ...) to snapshot state
+  without per-frame allocation, hence the [InternalsVisibleTo("Klotho.Friflo.Bridge")] in
+  src/ECS/Base/CompilerServices.cs — the assembly name below must stay in sync with it.
+-->
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
+    <AssemblyName>Klotho.Friflo.Bridge</AssemblyName>
+    <RootNamespace>Klotho.Friflo</RootNamespace>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Runtime\Klotho.Runtime.csproj" />
+    <ProjectReference Include="..\..\ECS\Friflo.Engine.ECS.csproj" />
+  </ItemGroup>
+
+</Project>

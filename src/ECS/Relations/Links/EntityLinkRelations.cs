@@ -101,6 +101,27 @@ internal class EntityLinkRelations<TRelation> : GenericEntityRelations<TRelation
         }
     }
     
+    /// <summary>
+    /// Rebuild <see cref="AbstractEntityRelations.linkEntityMap"/> from the relation data.
+    /// Used by the deterministic rollback bridge. See DeterministicAccess.cs.
+    /// </summary>
+    internal override void RebuildLinkLookup(int count)
+    {
+        var components  = heapGeneric.components;
+        var ids         = archetype.entityIds;
+        var map         = linkEntityMap;
+        var nodes       = store.nodes;
+        for (int position = 0; position < count; position++) {
+            int targetId = components[position].GetRelationKey().Id;
+            map.TryGetValue(targetId, out var sourceIds);
+            if (sourceIds.Count == 0) {
+                nodes[targetId].isLinked |= relationBit;
+            }
+            sourceIds.Add(ids[position], linkIdsHeap);
+            map[targetId] = sourceIds;
+        }
+    }
+
     private void RemoveIncomingLinks(IdArray positions, int id)
     {
         var positionsSpan   = positions.GetSpan(idHeap, store);

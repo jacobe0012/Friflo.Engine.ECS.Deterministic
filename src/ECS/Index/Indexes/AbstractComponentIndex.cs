@@ -12,7 +12,7 @@ namespace Friflo.Engine.ECS.Index;
 /// Base class to enable implementing a custom component index.<br/>
 /// A custom component index can be implemented to optimize indexing or component queries for a specific component type.   
 /// </summary>
-public abstract class AbstractComponentIndex
+public abstract partial class AbstractComponentIndex
 {
 #region properties    
     internal  abstract  int             Count { get; }
