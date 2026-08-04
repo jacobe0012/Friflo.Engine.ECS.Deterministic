@@ -61,6 +61,7 @@ public static class Program
         ScriptRollbackWorks();
         RelationHashIsIdentityBased();
         FullStateRoundTrips();
+        FullStateCarriesScriptsAndHierarchy();
 
         Console.WriteLine(failures == 0 ? "AOT smoke: PASS" : $"AOT smoke: FAIL ({failures})");
         return failures == 0 ? 0 : 1;
@@ -169,6 +170,41 @@ public static class Program
         var target = NewSimulation(out _);
         target.RestoreFromFullState(data);
         Check(target.GetStateHash() == hash, "full state round-trips with relations");
+    }
+
+    /// <summary>
+    /// Full state must carry scripts and the parent/child hierarchy with dynamic code disabled.
+    /// </summary>
+    /// <remarks>
+    /// Separate from <see cref="FullStateRoundTrips"/> because it covers a different hazard.
+    /// Writing a script's fields means discovering them from its <i>runtime</i> type, with no
+    /// static reference for the trimmer to follow — the same footing as the rollback path, which
+    /// once silently degraded to a no-op when that rooting was lost. A whole world arriving without
+    /// its scripts is how that failure would look to a server-driven client, and a hash comparison
+    /// alone would not say which part went missing, so the pieces are checked individually.
+    /// </remarks>
+    private static void FullStateCarriesScriptsAndHierarchy()
+    {
+        var source = NewSimulation(out var sourceStore);
+        var parent = sourceStore.CreateEntity(new Position { x = 7, y = 8 });
+        var child  = sourceStore.CreateEntity(new Position { x = 9, y = 10 });
+        parent.AddChild(child);
+        parent.AddScript(new Cooldown { remaining = 11, source = child });
+
+        var (data, hash) = source.SerializeFullStateWithHash();
+
+        var target = NewSimulation(out var targetStore);
+        target.RestoreFromFullState(data);
+        Check(target.GetStateHash() == hash, "full state round-trips with scripts and hierarchy");
+
+        var restoredParent = targetStore.GetEntityById(parent.Id);
+        // Reading a child is what throws when the child pool was not rebuilt from the ids.
+        Check(restoredParent.ChildCount == 1 && restoredParent.ChildEntities[0].Id == child.Id,
+              "hierarchy survives a full state");
+
+        var restored = restoredParent.GetScript<Cooldown>();
+        Check(restored != null && restored.remaining == 11, "script field survives a full state");
+        Check(restored != null && restored.source.Id == child.Id, "entity reference in a transferred script");
     }
 
     // ------------------------------------------------------------------ helpers

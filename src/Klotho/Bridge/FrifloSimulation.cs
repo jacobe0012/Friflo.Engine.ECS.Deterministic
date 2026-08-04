@@ -54,6 +54,17 @@ public sealed class FrifloSimulation : ISimulation
     /// <summary>Number of past ticks that can be rolled back to.</summary>
     public int RollbackCapacity => ring.Length;
 
+    /// <summary>How many times this simulation has been rolled back.</summary>
+    /// <remarks>
+    /// Counted here rather than read off the engine because the engine's own tally
+    /// (<c>KlothoEngine.Stats</c>) is kept only on the peer-to-peer path and only in debug builds;
+    /// the server-driven client calls <see cref="Rollback"/> directly. What it means differs by
+    /// mode: peer-to-peer rolls back when a prediction is contradicted, whereas a server-driven
+    /// client rewinds to each verified tick as a matter of course, so there a zero means the
+    /// re-simulation loop never ran at all.
+    /// </remarks>
+    public int RollbackCount { get; private set; }
+
     /// <summary>The simulation store. Do not mutate outside <see cref="Tick"/>.</summary>
     public EntityStore Store => store;
 
@@ -128,6 +139,7 @@ public sealed class FrifloSimulation : ISimulation
         }
         ring[slot].Restore();
         CurrentTick = targetTick;
+        RollbackCount++;
 
         // Snapshots for ticks after the rollback target belong to the abandoned branch.
         // Dropping them keeps GetNearestRollbackTick from offering a state that no longer

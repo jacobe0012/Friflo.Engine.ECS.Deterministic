@@ -44,8 +44,15 @@ internal static class ScriptLayout
         return plan;
     }
 
-    /// <summary>Write the deterministic field values of <paramref name="script"/> into <paramref name="leaves"/>.</summary>
-    internal static void Capture(Script script, ref ulong[] leaves)
+    /// <summary>
+    /// Write the deterministic field values of <paramref name="script"/> into
+    /// <paramref name="leaves"/>, growing it if needed. Returns how many entries were written.
+    /// </summary>
+    /// <remarks>
+    /// The buffer may be longer than the plan (it is reused across scripts of different types), so
+    /// the count is what callers must use rather than <c>leaves.Length</c>.
+    /// </remarks>
+    internal static int Capture(Script script, ref ulong[] leaves)
     {
         var plan  = PlanFor(script);
         int count = plan.Leaves.Length;
@@ -53,6 +60,7 @@ internal static class ScriptLayout
             leaves = new ulong[Math.Max(count, 4)];
         }
         plan.WriteObject(script, leaves, 0);
+        return count;
     }
 
     /// <summary>Write <paramref name="leaves"/> back into <paramref name="script"/>.</summary>

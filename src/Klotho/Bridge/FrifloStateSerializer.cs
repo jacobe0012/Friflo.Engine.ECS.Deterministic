@@ -19,11 +19,22 @@ namespace Klotho.Friflo;
 /// Component payloads are raw value bytes, matching the hashing rule in
 /// <c>StructHeap&lt;T&gt;.HashComponent</c>: components must be unmanaged value types.
 ///
+/// <para>The parent/child hierarchy and <see cref="Script"/>s need their own sections, for the
+/// same reasons <see cref="FrifloStoreSnapshot"/> handles them separately: a <c>TreeNode</c>'s
+/// child list is an <c>IdArray</c> handle into a pooled allocator (writing those raw bytes would
+/// hand the receiver offsets into a pool that never made the matching allocation), and scripts are
+/// class instances living outside the archetypes. Both are therefore written by content and
+/// rebuilt on read.</para>
+///
 /// This runs at join/resync time, not per tick, so it allocates freely.
 /// </remarks>
 internal sealed class FrifloStateSerializer
 {
-    private const int FormatVersion = 1;
+    /// <summary>
+    /// Bumped from 1 when the hierarchy and script sections were added: a peer reading the old
+    /// format would silently build a world with no scripts and a broken child pool.
+    /// </summary>
+    private const int FormatVersion = 2;
 
     private readonly EntityStore store;
 
@@ -50,6 +61,8 @@ internal sealed class FrifloStateSerializer
         WriteArchetypes(writer);
         WriteRelations(writer);
         WriteNodes(writer);
+        WriteHierarchy(writer);
+        WriteScripts(writer);
 
         writer.Flush();
         return buffer.ToArray();
@@ -122,6 +135,75 @@ internal sealed class FrifloStateSerializer
         }
     }
 
+    /// <summary>
+    /// Write the parent of every entity and the ids of its children.
+    /// </summary>
+    /// <remarks>
+    /// Child lists are written as plain ids rather than as the <c>TreeNode</c> components that
+    /// hold them. Those components store an <c>IdArray</c>, i.e. a <c>(start, count)</c> handle
+    /// into a pooled allocator: <c>start</c> is this peer's allocation history, and the receiving
+    /// store's pool has no matching allocation to point at. Reading such a handle back throws.
+    /// </remarks>
+    private void WriteHierarchy(BinaryWriter writer)
+    {
+        int capacity  = store.Capacity;
+        var parentMap = store.GetParentMap();
+        writer.Write(capacity);
+        for (int id = 0; id < capacity; id++) {
+            writer.Write(id < parentMap.Length ? parentMap[id] : 0);   // 0 == Static.NoParentId
+        }
+        var children = new int[8];
+        for (int id = 0; id < capacity; id++) {
+            int count = store.GetChildCount(id);
+            writer.Write(count);
+            if (count == 0) {
+                continue;
+            }
+            if (children.Length < count) {
+                children = new int[count];
+            }
+            store.CopyChildIds(id, children, 0);
+            // Child order is meaningful (InsertChild positions matter), so it is preserved.
+            for (int n = 0; n < count; n++) {
+                writer.Write(children[n]);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Write every script: which entity holds it, which type it is, and its field values.
+    /// </summary>
+    /// <remarks>
+    /// The type travels as its <c>ScriptType.ScriptIndex</c> — a schema position both peers derive
+    /// from the same build — and the values as the deterministic leaves of the same layout plan
+    /// components use, so an <see cref="Entity"/> field contributes only its <c>(Id, Revision)</c>.
+    /// </remarks>
+    private void WriteScripts(BinaryWriter writer)
+    {
+        // Counted first, since a script-bearing entity may hold several.
+        int total = 0;
+        int count = store.ScriptEntityCount;
+        for (int n = 0; n < count; n++) {
+            store.GetScriptsAt(n, out _, out var scripts);
+            total += scripts.Length;
+        }
+        writer.Write(total);
+
+        var leaves = Array.Empty<ulong>();
+        for (int n = 0; n < count; n++) {
+            store.GetScriptsAt(n, out int entityId, out var scripts);
+            foreach (var script in scripts) {
+                writer.Write(entityId);
+                writer.Write(EntityStore.GetScriptIndex(script));
+                int written = ScriptLayout.Capture(script, ref leaves);
+                writer.Write(written);
+                for (int i = 0; i < written; i++) {
+                    writer.Write(leaves[i]);
+                }
+            }
+        }
+    }
+
     // ------------------------------------------------------------------ read
 
     /// <summary>Replace the store's state with <paramref name="data"/>. Returns the serialized tick.</summary>
@@ -151,6 +233,11 @@ internal sealed class FrifloStateSerializer
         store.SequenceId          = sequenceId;
         store.SetRecycleIds(recycleIds, recycleCount);
         store.EntityCountInternal = entityCount;
+
+        // After ReadNodes: rebuilding the child pool walks the nodes to find each TreeNode, and
+        // attaching a script needs the owning entity's restored revision.
+        ReadHierarchy(reader);
+        ReadScripts(reader);
 
         store.RebuildIndexesAndRelations();
         return currentTick;
@@ -218,6 +305,59 @@ internal sealed class FrifloStateSerializer
         }
         archetype.SetEntityCount(entityCount);
         return archetype;
+    }
+
+    /// <summary>Restore the parent map and rebuild the child pool from the serialized ids.</summary>
+    private void ReadHierarchy(BinaryReader reader)
+    {
+        int capacity  = reader.ReadInt32();
+        var parentMap = new int[Math.Max(capacity, 1)];
+        for (int id = 0; id < capacity; id++) {
+            parentMap[id] = reader.ReadInt32();
+        }
+
+        var childStarts = new int[Math.Max(capacity, 1)];
+        var childCounts = new int[Math.Max(capacity, 1)];
+        var childIds    = new List<int>();
+        for (int id = 0; id < capacity; id++) {
+            int count       = reader.ReadInt32();
+            childStarts[id] = childIds.Count;
+            childCounts[id] = count;
+            for (int n = 0; n < count; n++) {
+                childIds.Add(reader.ReadInt32());
+            }
+        }
+
+        store.SetParentMap(parentMap, capacity);
+        // Allocates a fresh child list per TreeNode, so the restored handles point into this
+        // store's own pool rather than at the sender's offsets.
+        store.RebuildChildHeap(childIds.ToArray(), childStarts, childCounts, capacity);
+    }
+
+    /// <summary>Recreate every script and attach it to its entity.</summary>
+    /// <remarks>
+    /// New instances, unlike the rollback path which rewrites the fields of the instances it
+    /// already holds: a full state replaces the world wholesale, and the receiving store may never
+    /// have held a script of this type at all.
+    /// </remarks>
+    private void ReadScripts(BinaryReader reader)
+    {
+        store.ClearScripts();
+        int count = reader.ReadInt32();
+        for (int i = 0; i < count; i++) {
+            int entityId    = reader.ReadInt32();
+            int scriptIndex = reader.ReadInt32();
+            int leafCount   = reader.ReadInt32();
+            var leaves      = new ulong[Math.Max(leafCount, 1)];
+            for (int n = 0; n < leafCount; n++) {
+                leaves[n] = reader.ReadUInt64();
+            }
+            var script = EntityStore.CreateScript(scriptIndex);
+            // Bind before attaching: Entity-typed fields are re-bound to this store, so the
+            // instance is already consistent by the time anything can observe it.
+            ScriptLayout.Restore(script, leaves, store);
+            store.RestoreScript(entityId, script);
+        }
     }
 
     private void ReadNodes(BinaryReader reader, int capacity, List<Archetype> archetypes)

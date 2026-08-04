@@ -248,6 +248,36 @@ namespace Friflo.Engine.ECS
         {
             extension.AppendScript(new Entity(this, entityId, nodes[entityId].revision), script);
         }
+
+        /// <summary>
+        /// The schema index of <paramref name="script"/>'s type — its position in
+        /// <see cref="EntitySchema.Scripts"/>.
+        /// </summary>
+        /// <remarks>
+        /// Used to name a script type on the wire. The index is assigned when the schema is built
+        /// from the loaded assemblies, so two peers running the same build agree on it, and it
+        /// costs one int rather than a type name.
+        /// </remarks>
+        internal static int GetScriptIndex(Script script)
+            => Static.EntitySchema.ScriptTypeByType[script.GetType()].ScriptIndex;
+
+        /// <summary>
+        /// Create an instance of the script type registered at <paramref name="scriptIndex"/>.
+        /// </summary>
+        /// <remarks>
+        /// The full-state path builds a whole world from bytes, so unlike a rollback — which keeps
+        /// each script instance and only rewrites its fields — the receiving store may hold no
+        /// instance to write into and needs a new one.
+        /// </remarks>
+        internal static Script CreateScript(int scriptIndex)
+        {
+            var scripts = Static.EntitySchema.Scripts;
+            if (scriptIndex < 1 || scriptIndex >= scripts.Length) {
+                throw new ArgumentOutOfRangeException(nameof(scriptIndex), scriptIndex,
+                    $"no script type registered at this index. the schema holds {scripts.Length - 1}");
+            }
+            return scripts[scriptIndex].CreateScript();
+        }
         #endregion
 
     #region archetype lookup
