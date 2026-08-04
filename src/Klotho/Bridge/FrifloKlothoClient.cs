@@ -388,6 +388,36 @@ public sealed class FrifloKlothoClient : IDisposable
     public void SetReady(bool ready = true) => networkService.SetReady(ready);
 
     /// <summary>
+    /// Supply somewhere to persist what a later reconnect needs: the server's address, the session
+    /// magic, and this client's player id.
+    /// </summary>
+    /// <param name="store">The persistence backend. Nothing is saved without one.</param>
+    /// <param name="appVersion">
+    /// Build identifier, recorded with the credentials and compared on reload. A build that no
+    /// longer simulates identically must not rejoin the match it left.
+    /// </param>
+    /// <param name="deviceIdProvider">
+    /// Optional device identity, recorded with the credentials. The server rejects a reconnect
+    /// presenting a different one, so another machine cannot claim the slot.
+    /// </param>
+    /// <remarks>
+    /// Call before the match starts: the credentials are written when the match does, and again on
+    /// each join, so a store attached later saves nothing until the next such moment. To reconnect,
+    /// load them and run <c>KlothoConnection.Reconnect</c>, then hand the result to
+    /// <see cref="JoinRunningMatch"/>.
+    /// <para>
+    /// Only useful together with <c>Stop(keepReconnectCredentials: true)</c>, or a process that
+    /// died without stopping at all — an ordinary stop clears them, since a client that left
+    /// deliberately is not coming back.
+    /// </para>
+    /// </remarks>
+    public void SetReconnectCredentialsStore(
+        IReconnectCredentialsStore store,
+        string                     appVersion,
+        IDeviceIdProvider          deviceIdProvider = null) =>
+        networkService.SetReconnectCredentialsStore(store, appVersion, deviceIdProvider);
+
+    /// <summary>
     /// Advance one frame: pump the transport and the engine.
     /// </summary>
     /// <param name="deltaTime">Elapsed wall-clock seconds since the previous call.</param>

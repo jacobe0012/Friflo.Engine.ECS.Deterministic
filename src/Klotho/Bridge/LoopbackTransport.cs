@@ -429,15 +429,17 @@ public sealed class LoopbackTransport : INetworkTransport
 
     /// <inheritdoc />
     /// <remarks>
-    /// Addressing an unconnected peer is a bug in the caller — dropping it silently, as a real
-    /// transport would for an unknown peer, would surface much later as an unexplained protocol
-    /// stall.
+    /// Addressing a peer that is not connected is dropped, matching <c>LiteNetLibTransport.Send</c>,
+    /// which returns as soon as its peer map has no entry. It is not necessarily a caller bug:
+    /// Klotho broadcasts a departure to everyone in <c>_peerToPlayer</c> from inside its
+    /// disconnect handler, and the peer that just left is still in that map. Throwing here — which
+    /// this did at first — turns an ordinary disconnect into a crash that a real transport would
+    /// not produce.
     /// </remarks>
     public void Send(int peerId, byte[] data, int length, DeliveryMethod deliveryMethod)
     {
         if (!peers.Contains(peerId)) {
-            throw new ArgumentOutOfRangeException(
-                nameof(peerId), peerId, $"not a connected peer of endpoint {localPeerId}");
+            return;
         }
         Enqueue(peerId, data, length, deliveryMethod);
     }
