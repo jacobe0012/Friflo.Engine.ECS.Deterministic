@@ -1,0 +1,37 @@
+<!--
+  Klotho.UdpMatch — runs a server-driven match over real LiteNetLib UDP, with the server and each
+  client in a separate OS process.
+
+  Every other networked check runs on the in-memory LoopbackHub, where delivery is synchronous and
+  in-process. That is deliberate — it makes a hash mismatch attributable to the simulation — but it
+  means the real socket path has never executed: no serialization across a process boundary, no
+  MTU, no OS scheduling between peers, no independent clocks. A bridge could depend on any of those
+  without knowing it.
+
+  One binary, three roles, selected by argv: "server", "client", and "match" — a coordinator that
+  launches the other two as child processes and compares what they recorded. See Program.cs for the
+  exact invocation; an XML comment cannot carry the command line, since MSBuild rejects the double
+  dash that every option on it begins with.
+
+  Exits non-zero if the peers disagreed, so it works as a build gate.
+-->
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AssemblyName>Klotho.UdpMatch</AssemblyName>
+    <RootNamespace>Klotho.Friflo.UdpMatch</RootNamespace>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Bridge\Klotho.Friflo.Bridge.csproj" />
+    <ProjectReference Include="..\Runtime\Klotho.Runtime.csproj" />
+    <ProjectReference Include="..\..\ECS\Friflo.Engine.ECS.csproj" />
+  </ItemGroup>
+
+</Project>
