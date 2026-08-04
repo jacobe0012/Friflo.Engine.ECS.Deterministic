@@ -96,8 +96,15 @@ internal sealed class DeterministicPlan
         }
     }
 
+    // Suppressing IL2070 here silences the analyzer, it does not preserve anything: the fields must
+    // actually be rooted at the registration entry points, which annotate their type parameter with
+    // DynamicallyAccessedMembers (see NativeAOT.RegisterScript). Registering a type keeps the type,
+    // NOT its field metadata - a script whose fields ILC trimmed walks to zero leaves here, and the
+    // snapshot then captures and restores nothing at all, without ever throwing. Components reach
+    // this through DeterministicLayout<T>, whose T is statically known, so they root themselves.
     [UnconditionalSuppressMessage("TrimAnalysis", "IL2070",
-        Justification = "Component and script types are rooted by the entity schema, which registers them explicitly.")]
+        Justification = "Field metadata is preserved by the DynamicallyAccessedMembers annotations on the " +
+                        "registration entry points; component types arrive via the statically-known DeterministicLayout<T>.")]
     private static void Walk(Type type, List<FieldInfo> path, List<DeterministicLeaf> leaves, Type rootType)
     {
         // Declaration order is stable for a given build, and writer and reader share this plan,

@@ -9,7 +9,8 @@
 ## 实施结果（2026-08-04）
 
 **验收全部通过**：`dotnet build Engine.sln`（Debug + Release）0 错误；现有 `Tests` 656/656、
-`Tests-internal` 133/133 全绿；新增 `Klotho.Tests` 50/50 通过。
+`Tests-internal` 133/133 全绿；新增 `Klotho.Tests` 50/50 通过；
+NativeAOT 真机二进制 8/8 通过（第三轮补测，见下）。
 Klotho 源码经 `diff -r` 校验与上游**逐字节一致，改动 0 行**。
 
 ### 实施中推翻的三个方案假设
@@ -47,17 +48,68 @@ Klotho 源码经 `diff -r` 校验与上游**逐字节一致，改动 0 行**。
 
 **NativeAOT 实测结论**：
 - 布局计划改为双路径：能生成代码时编译表达式树，`RuntimeFeature.IsDynamicCodeSupported == false` 时改用反射解释。原实现无条件用表达式树，AOT 下必然在第一次哈希时抛异常。
-- 新增 `src/Klotho/AotSmoke`（`PublishAot=true`，故 `IsDynamicCodeSupported` 实为 false），8 项检查全通过：关系回滚、Script 回滚、关系哈希按身份而非地址、全量状态往返。
-- ILC 分析：**19 条警告全部来自 `Friflo.Json.Fliox`（既有依赖），本次新增代码 0 条**。
+- 新增 `src/Klotho/AotSmoke`（`PublishAot=true`，故 `IsDynamicCodeSupported` 实为 false），覆盖：关系回滚、Script 回滚、关系哈希按身份而非地址、全量状态往返。
 - 测试 `InterpretedHash_MatchesCompiledHash` 断言两条路径哈希一致——否则 AOT 客户端会与 JIT 客户端互相 desync。
 
-> **诚实边界**：本机 native 链接因缺 `vswhere.exe`（VS 工具链问题）未能产出 exe，故**未在真机原生二进制上跑过**。ILC 全量分析已完成且无本代码告警，反射路径也在 `IsDynamicCodeSupported=false` 下实测通过。
+### 第三轮：AOT 真机二进制实测（2026-08-04 复核）
+
+上一轮记的「8 项检查全通过」是在 JIT 下跑 `dotnet test` 得出的，与同段落自述的
+「未在真机原生二进制上跑过」自相矛盾。本轮补跑真机二进制，**推翻了该结论**。
+
+先解决链接：本机 VS 18 + MSVC 14.50 工具链齐备，`vswhere.exe` 也在
+`C:\Program Files (x86)\Microsoft Visual Studio\Installer\`。ILC 以**无路径**方式调用
+`vswhere.exe`，它不在 PATH 上 → 其报错文本被拼进链接器路径 → `MSB3073 exit 123`，
+看起来像缺工具链，实为缺 PATH 条目。补上 PATH 后成功产出
+`Klotho.AotSmoke.exe`（7.4 MB）。
+
+首次真机运行 **8 项里 2 项 FAIL + 1 处未捕获异常**（进程 exit 127）：
+
+| 现象 | 根因 | 修复 |
+|---|---|---|
+| `[FAIL] script field restored by rollback`、`[FAIL] entity reference in script restored` | Script 字段经**运行期类型**发现（`ScriptLayout` → `DeterministicPlan.Get(script.GetType())`），无任何静态引用为 ILC 锚定，字段元数据被裁剪 → `GetFields` 返回空 → 计划 0 个 leaf → capture/restore **静默变成 no-op** | `NativeAOT.RegisterScript<T>` 的泛型参数加 `[DynamicallyAccessedMembers(PublicFields \| NonPublicFields)]`，在必经注册点锚定字段 |
+| `InvalidOperationException: Native AOT requires registration of IIndexedComponent` | `AotSmoke` 自身注册顺序 bug：`Register*` 均由 `if (typeSet.Add(typeof(T)))` 把关，**重复注册整段跳过**。先调 `RegisterComponent<Team>()` 使随后的 `RegisterIndexedComponentStruct<Team,int>()` 静默失效，索引工厂从未安装 | 删掉多余的 `RegisterComponent<Team>()`（专用方法本就注册组件类型），并注释说明该去重语义 |
+
+**关于「ILC 0 条本代码告警」**：该说法当时成立但具误导性——
+`DeterministicComponentLayout.cs` 上的 `[UnconditionalSuppressMessage("TrimAnalysis", "IL2070")]`
+压掉的正是会报告此事的告警，且其 justification（「类型已由 entity schema 显式注册」）
+本身就是错的：**注册类型 ≠ 保留其字段元数据**。该 justification 已订正为如实描述真实前提。
+
+**防止静默复发**：`ScriptLayout` 现在对空计划直接抛错。每个 `Script` 都继承基类
+`entity` 字段，故 0 leaf 不可能合法；若锚定再次丢失，会当场报错而非悄悄丢状态、
+在很久之后表现为无法解释的 desync。
+
+修复后真机二进制 **8/8 通过，退出码 0**：
+
+```
+IsDynamicCodeSupported = False
+  [ok] relation removed / restored / target preserved
+  [ok] script field restored by rollback
+  [ok] entity reference in script restored
+  [ok] script instance identity kept
+  [ok] relation hash is identity-based, not address-based
+  [ok] full state round-trips with relations
+AOT smoke: PASS
+```
+
+复核方式（`vswhere` 必须在 PATH 上，否则链接失败）：
+
+```bash
+PATH="$PATH:/c/Program Files (x86)/Microsoft Visual Studio/Installer" \
+  dotnet publish src/Klotho/AotSmoke/Klotho.AotSmoke.csproj -r win-x64 -c Release
+./src/Klotho/AotSmoke/bin/Release/net8.0/win-x64/publish/Klotho.AotSmoke.exe
+echo $?   # 0 = 全部通过；非 0 即失败，可直接作构建门禁
+```
+
+回归：`dotnet build Engine.sln` 0 错误且**告警数与改动前逐项一致**（本次新增 0 条）；
+`Tests` 656/656、`Tests-internal` 133/133（1 skipped）、`Klotho.Tests` 50/50 全绿。
+对 Friflo 既有文件的改动增加 1 处（`RegisterScript` 的注解，纯新增 attribute，
+不改变任何运行时行为，JIT 路径不受影响）。
 
 ### 已知遗留
 
 - 单次 `Tests` 运行中曾出现 1 例失败，其后 15 次连续运行均 656/656 通过，**未能复现、未能定位到具体用例**，故如实记录而非判定为无害。
-- NativeAOT 未完成 native 链接产物验证（原因如上，属本机环境问题）。
-- 第二阶段（真实网络）尚未验证，风险 3 仍然成立。
+- ~~NativeAOT 未完成 native 链接产物验证~~ **已完成**：真机二进制已产出并 8/8 通过（见「第三轮」）。仅在 `win-x64` 上验证过，其它 RID 未测。
+- 第二阶段（真实网络）尚未验证，风险 3 仍然成立。已确认的可行性前提：`KlothoEngine.Initialize` 接受 `ISimulation`（`KlothoEngine.cs:623/769`），且回滚主循环 `KlothoEngine.Rollback.cs` **零 `EcsSimulation` 耦合**；硬耦合集中在 `KlothoSession.Create`（`KlothoSession.cs:358` 直接 `new EcsSimulation`）与诊断/错误修正等旁路分支。方向：自写 session 组装绕过 `KlothoSession.Create`，保持 Klotho 源码 0 改动。
 
 ## Context
 
@@ -71,7 +123,10 @@ Klotho 0.7.1 恰好提供这些：CSP/回滚/帧同步/Server-Driven/回放，�
 
 ---
 
-## 前置阻塞项（必须先解决）
+## 前置阻塞项（已解除）
+
+> **已解除（2026-08-04 复核）**：本机现有 SDK `10.0.302`，`dotnet build Engine.sln` 通过。
+> 以下为当初的记录，保留作背景。
 
 **本机无法构建本项目**。实测：
 
@@ -236,9 +291,10 @@ TargetSystem : [IIndexedComponent] Team 按阵营查敌
 
 **重建方案的待验证点**：索引/关系重建需调用 Friflo 内部 API 逐实体重新登记。若 Friflo 未暴露合适的批量重建入口，可能需要通过"先清空 index/relations、再逐实体重新 Add"实现——这会在实现阶段确认。若该路径不可行，会立即报告并给出替代方案（深拷或降级为契约禁用），不静默降级。
 
-### 风险 2：验收标准依赖 SDK 安装
+### 风险 2：验收标准依赖 SDK 安装 ✅ 已解除
 
 未装 .NET 10 SDK 前，无法编译、无法跑验证、无法达成验收标准。
+> 本机已装 `10.0.302`，风险解除。AOT 验收另需 VS C++ 工具链且 `vswhere` 在 PATH 上（见「第三轮」）。
 
 ### 风险 3：Klotho 网络层与桥接层的耦合面未完全验证
 
@@ -273,6 +329,12 @@ dotnet build src/Klotho/Bridge/Klotho.Friflo.Bridge.csproj
 
 # 3. 确定性验证（核心验收）
 dotnet test src/Klotho/Tests/Klotho.Tests.csproj
+
+# 4. NativeAOT 真机二进制（vswhere 必须在 PATH 上）
+PATH="$PATH:/c/Program Files (x86)/Microsoft Visual Studio/Installer" \
+  dotnet publish src/Klotho/AotSmoke/Klotho.AotSmoke.csproj -r win-x64 -c Release
+./src/Klotho/AotSmoke/bin/Release/net8.0/win-x64/publish/Klotho.AotSmoke.exe
+echo $?   # 必须为 0
 ```
 
 **通过标准**：
@@ -281,6 +343,7 @@ dotnet test src/Klotho/Tests/Klotho.Tests.csproj
 - 覆盖四条路径：组件数据变化、实体创建、实体销毁、**索引/关系回滚后一致**
 - 索引/关系专项断言：回滚后按索引查询的结果集与回滚前同 tick 完全一致
 - 稳态快照零 GC 分配（`GC.GetAllocatedBytesForCurrentThread()` 断言，**仅针对第 1–3 层**；第 4 层重建只在回滚时触发，不计入每帧稳态）
+- **AOT 原生二进制** 打印 `IsDynamicCodeSupported = False` 且 `AOT smoke: PASS`，退出码 0。注意：`dotnet test` 恒有 JIT，跑不到反射路径，故此项**必须跑真机 exe**，不能以 JIT 测试代替
 
 ---
 

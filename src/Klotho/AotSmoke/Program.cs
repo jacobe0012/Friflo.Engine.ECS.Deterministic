@@ -73,12 +73,19 @@ public static class Program
     /// Friflo requires this under NativeAOT for indexed components and relations
     /// (see <c>NativeAOT.RegisterRelation</c>); it is a pre-existing constraint of the engine,
     /// not something the bridge introduces.
+    /// <para>
+    /// Register each type exactly once, through its most specific method. Every <c>Register*</c>
+    /// is guarded by <c>if (typeSet.Add(typeof(T)))</c>, so a second call for the same type is
+    /// skipped in full — silently. Calling <c>RegisterComponent&lt;Team&gt;()</c> before
+    /// <c>RegisterIndexedComponentStruct&lt;Team, int&gt;()</c> would leave the index factory
+    /// uninstalled, and the first entity carrying a <c>Team</c> would throw. The specific method
+    /// already registers the component type itself.
+    /// </para>
     /// </remarks>
     private static void RegisterAotTypes()
     {
         var aot = new NativeAOT();
         aot.RegisterComponent<Position>();
-        aot.RegisterComponent<Team>();
         aot.RegisterIndexedComponentStruct<Team, int>();
         aot.RegisterRelation<Targeting, Entity>();
         aot.RegisterLinkRelation<Targeting>();

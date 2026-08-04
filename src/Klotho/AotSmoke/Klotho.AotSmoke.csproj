@@ -7,8 +7,19 @@
   through reflection instead of compiling expression trees. A plain `dotnet test` run cannot
   cover that: the JIT is always available there.
 
-  Not part of Engine.sln's default build — publishing AOT needs the C++ toolchain. Run it with:
-      dotnet publish src/Klotho/AotSmoke/Klotho.AotSmoke.csproj -r win-x64 -c Release
+  Publishing (not just building) is the point: the checks only mean something when they run as a
+  native binary, where IsDynamicCodeSupported is actually false. The program exits non-zero on the
+  first failed check, so it works as a build gate.
+
+  Not part of Engine.sln's default build — publishing AOT needs the C++ toolchain (Visual Studio
+  with the C++ workload). ILC invokes `vswhere.exe` without a path, so its install directory must be
+  on PATH; otherwise the link fails late with MSB3073 exit 123 and vswhere's own error text spliced
+  into the linker path, which reads like a missing toolchain rather than a missing PATH entry.
+
+      PATH="$PATH:/c/Program Files (x86)/Microsoft Visual Studio/Installer" \
+        dotnet publish src/Klotho/AotSmoke/Klotho.AotSmoke.csproj -r win-x64 -c Release
+      ./src/Klotho/AotSmoke/bin/Release/net8.0/win-x64/publish/Klotho.AotSmoke.exe
+      echo $?   # 0 = all checks passed
 -->
 <Project Sdk="Microsoft.NET.Sdk">
 

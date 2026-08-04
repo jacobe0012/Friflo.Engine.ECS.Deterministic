@@ -216,7 +216,15 @@ A type initializer threw an exception. To determine which type, inspect the Inne
         }
     }
     
-    public void RegisterScript<T>()  where T : Script, new()
+    // The field annotation keeps ILC from trimming T's field reflection metadata. The deterministic
+    // rollback bridge reads a script's fields through its runtime type (DeterministicPlan.Get on
+    // script.GetType()), which no static reference roots. Without this, GetFields returns nothing
+    // under NativeAOT, the plan comes out empty, and capturing/restoring a script silently does
+    // nothing instead of failing loudly. Registering the type is not enough - that keeps the type,
+    // not its members.
+    public void RegisterScript<[DynamicallyAccessedMembers(
+            DynamicallyAccessedMemberTypes.PublicFields |
+            DynamicallyAccessedMemberTypes.NonPublicFields)] T>()  where T : Script, new()
     {
         InitSchema();
         if (typeSet.Add(typeof(T))) {
