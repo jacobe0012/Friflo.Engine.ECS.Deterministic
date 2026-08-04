@@ -47,7 +47,35 @@ internal sealed class FrifloStateHasher
         foreach (var archetype in relationArchetypes) {
             total += HashArchetype(archetype);
         }
+        total += HashScripts();
         return unchecked((long)total);
+    }
+
+    /// <summary>
+    /// Sum of the per-script hashes. Scripts live outside the archetypes, so without this a
+    /// script field diverging between peers would not be detected.
+    /// </summary>
+    private ulong HashScripts()
+    {
+        const ulong prime = 1099511628211;
+        ulong sum   = 0;
+        int   count = store.ScriptEntityCount;
+        for (int n = 0; n < count; n++) {
+            store.GetScriptsAt(n, out int entityId, out var scripts);
+            foreach (var script in scripts) {
+                // Seed with the owning entity and the script type, so moving a script between
+                // entities - or swapping one script type for another - changes the hash.
+                ulong hash = FnvOffset;
+                hash ^= (ulong)(uint)entityId;
+                hash *= prime;
+                hash ^= HashTypeName(script.GetType());
+                hash *= prime;
+                hash ^= ScriptLayout.Hash(script);
+                hash *= prime;
+                sum  += hash;
+            }
+        }
+        return sum;
     }
 
     /// <summary>Sum of the per-entity hashes of one archetype. Commutative, so slot order is irrelevant.</summary>
@@ -77,6 +105,29 @@ internal sealed class FrifloStateHasher
         }
         return sum;
     }
+
+    /// <summary>
+    /// Hash a type by its full name, character by character.
+    /// </summary>
+    /// <remarks>
+    /// Not <c>string.GetHashCode</c>: .NET randomizes string hashing per process, so it would
+    /// differ between two peers running identical code — the exact failure this hash exists to
+    /// detect. Cached per type, since the result never changes.
+    /// </remarks>
+    private ulong HashTypeName(Type type)
+    {
+        if (typeNameHashes.TryGetValue(type, out var cached)) {
+            return cached;
+        }
+        ulong hash = FnvOffset;
+        foreach (var c in type.FullName ?? type.Name) {
+            hash ^= c;
+            hash *= FnvPrime;
+        }
+        return typeNameHashes[type] = hash;
+    }
+
+    private readonly Dictionary<Type, ulong> typeNameHashes = new();
 
     private static void Mix(ref ulong hash, ulong value)
     {

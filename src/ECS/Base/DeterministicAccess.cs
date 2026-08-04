@@ -124,6 +124,133 @@ namespace Friflo.Engine.ECS
                 }
             }
         }
+        #endregion
+
+    #region hierarchy (parent / child)
+        /// <summary>Parent id of each entity, indexed by entity id. 0 means "no parent".</summary>
+        /// <remarks>
+        /// The child lists live in <see cref="TreeNode"/> components (restored with the archetypes)
+        /// but they hold <see cref="Collections.IdArray"/> handles into <see cref="StoreExtension.childHeap"/>,
+        /// so the heap has to be rebuilt from those components. See <see cref="RebuildChildHeap"/>.
+        /// </remarks>
+        internal int[] GetParentMap() => extension.parentMap;
+
+        /// <summary>Overwrite the parent map with the first <paramref name="count"/> entries of <paramref name="source"/>.</summary>
+        internal void SetParentMap(int[] source, int count)
+        {
+            var parentMap = extension.parentMap;
+            if (parentMap.Length < count) {
+                extension.parentMap = parentMap = new int[count];
+            }
+            Array.Copy(source, parentMap, count);
+            for (int id = count; id < parentMap.Length; id++) {
+                parentMap[id] = Static.NoParentId;
+            }
+        }
+
+        /// <summary>
+        /// Rebuild <see cref="StoreExtension.childHeap"/> so every restored <see cref="TreeNode"/>
+        /// owns a freshly allocated child list holding the same ids.
+        /// </summary>
+        /// <remarks>
+        /// A <see cref="TreeNode"/> stores an <see cref="Collections.IdArray"/>, i.e. a
+        /// <c>(start, count)</c> handle into a pooled allocator — <c>start</c> is an allocator
+        /// offset, not data. Restoring the raw component bytes would leave those handles pointing
+        /// at whatever the pool holds now. The child ids themselves were captured separately and
+        /// are re-inserted here, which also re-establishes the pool's free lists.
+        /// </remarks>
+        internal void RebuildChildHeap(int[] childIds, int[] childStarts, int[] childCounts, int nodeCount)
+        {
+            var heap    = extension.childHeap;
+            var treeHeap = (StructHeap<TreeNode>)null;
+
+            for (int id = 0; id < nodeCount; id++) {
+                int count = childCounts[id];
+                ref var node = ref nodes[id];
+                var archetype = node.archetype;
+                if (archetype == null) {
+                    continue;
+                }
+                var heapEntry = archetype.heapMap[StructInfo<TreeNode>.Index];
+                if (heapEntry == null) {
+                    continue;
+                }
+                treeHeap = (StructHeap<TreeNode>)heapEntry;
+                ref var treeNode = ref treeHeap.components[node.compIndex];
+                // Drop the stale handle before allocating a new one, so the pool does not leak.
+                treeNode.childIds = default;
+                if (count == 0) {
+                    continue;
+                }
+                treeNode.childIds.SetArray(new ReadOnlySpan<int>(childIds, childStarts[id], count), heap);
+            }
+        }
+
+        /// <summary>Number of child ids of the entity <paramref name="id"/>, or 0 if it has none.</summary>
+        internal int GetChildCount(int id)
+        {
+            ref var node = ref nodes[id];
+            var archetype = node.archetype;
+            var heapEntry = archetype?.heapMap[StructInfo<TreeNode>.Index];
+            if (heapEntry == null) {
+                return 0;
+            }
+            return ((StructHeap<TreeNode>)heapEntry).components[node.compIndex].childIds.count;
+        }
+
+        /// <summary>Copy the child ids of entity <paramref name="id"/> into <paramref name="target"/>.</summary>
+        /// <summary>The pool backing every <see cref="TreeNode"/> child list.</summary>
+        internal Collections.IdArrayHeap GetChildHeap() => extension.childHeap;
+
+        internal void CopyChildIds(int id, int[] target, int targetOffset)
+        {
+            ref var node  = ref nodes[id];
+            var heapEntry = node.archetype?.heapMap[StructInfo<TreeNode>.Index];
+            if (heapEntry == null) {
+                return;
+            }
+            ref var treeNode = ref ((StructHeap<TreeNode>)heapEntry).components[node.compIndex];
+            var span = treeNode.childIds.GetSpan(extension.childHeap, this);
+            span.CopyTo(new Span<int>(target, targetOffset, span.Length));
+        }
+        #endregion
+
+    #region scripts
+        /// <summary>Number of entities holding one or more <see cref="Script"/>s.</summary>
+        internal int ScriptEntityCount => extension.entityScriptCount - 1;
+
+        /// <summary>The scripts of the <paramref name="index"/>-th script-bearing entity.</summary>
+        internal void GetScriptsAt(int index, out int entityId, out Script[] scripts)
+        {
+            ref var entry = ref extension.entityScripts[index + 1];   // invariant: slot 0 is unused
+            entityId = entry.id;
+            scripts  = entry.scripts;
+        }
+
+        /// <summary>Remove every script from the store, so they can be re-added from a snapshot.</summary>
+        internal void ClearScripts()
+        {
+            var scripts = extension.entityScripts;
+            for (int n = 1; n < extension.entityScriptCount; n++) {
+                scripts[n] = default;
+            }
+            extension.entityScriptCount = 1;
+            extension.scriptMap.Clear();
+        }
+
+        /// <summary>Attach <paramref name="script"/> to the entity <paramref name="entityId"/>.</summary>
+        /// <remarks>
+        /// Used when restoring a snapshot. Unlike <c>Entity.AddScript</c> this raises no event:
+        /// a rollback is not an application-level script addition, and re-raising would make
+        /// handlers observe the same script being added many times.
+        /// </remarks>
+        internal void RestoreScript(int entityId, Script script)
+        {
+            extension.AppendScript(new Entity(this, entityId, nodes[entityId].revision), script);
+        }
+        #endregion
+
+    #region archetype lookup
         /// <summary>
         /// Return the archetype holding exactly <paramref name="structIndices"/> and
         /// <paramref name="tagBits"/>, creating it if this store has not used it yet.
@@ -245,8 +372,37 @@ namespace Friflo.Engine.ECS
         internal int GetHeapStructIndex(int heapIndex) => structHeaps[heapIndex].structIndex;
 
         /// <summary>Deterministic hash of the component at <paramref name="slot"/> in heap <paramref name="heapIndex"/>.</summary>
+        /// <remarks>
+        /// <see cref="TreeNode"/> is hashed by its child ids rather than its bytes. It stores an
+        /// <see cref="Collections.IdArray"/> whose <c>start</c> is an offset into a pooled
+        /// allocator, so two peers holding the very same hierarchy can carry different offsets
+        /// purely because of allocation history — hashing the bytes would report a desync that
+        /// does not exist.
+        /// </remarks>
         internal ulong HashHeapComponent(int heapIndex, int slot)
-            => structHeaps[heapIndex].HashComponent(slot);
+        {
+            var heap = structHeaps[heapIndex];
+            if (heap.structIndex == StructInfo<TreeNode>.Index) {
+                return HashTreeNode(((StructHeap<TreeNode>)heap).components[slot]);
+            }
+            return heap.HashComponent(slot);
+        }
+
+        /// <summary>Hash a <see cref="TreeNode"/> by the child ids it references, in order.</summary>
+        private ulong HashTreeNode(in TreeNode treeNode)
+        {
+            const ulong prime = 1099511628211;
+            ulong hash = 14695981039346656037;
+            var   span = treeNode.childIds.GetSpan(entityStore.GetChildHeap(), entityStore);
+            // Child order is meaningful (InsertChild positions matter), so it is hashed in order.
+            hash ^= (ulong)(uint)span.Length;
+            hash *= prime;
+            foreach (var childId in span) {
+                hash ^= (ulong)(uint)childId;
+                hash *= prime;
+            }
+            return hash;
+        }
 
         /// <summary>Tag bits of this archetype.</summary>
         internal long GetTagBits() => tags.bitSet.l0;

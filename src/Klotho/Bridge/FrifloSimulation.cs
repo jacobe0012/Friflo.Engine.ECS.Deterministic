@@ -16,18 +16,21 @@ namespace Klotho.Friflo;
 /// <b>Determinism contract.</b> The store passed here is the <i>simulation</i> store and must be
 /// kept separate from any presentation store. Within it:
 /// <list type="bullet">
-///   <item>Components must be fully unmanaged value types. Reference fields are rejected when
-///         hashing — their bytes are addresses that differ per run and per peer.</item>
+///   <item>Components and scripts may contain only value types — plus <see cref="Entity"/>, which
+///         contributes just its <c>(Id, Revision)</c>. Any other reference field is rejected: its
+///         bytes are an address that differs per run and per peer.</item>
 ///   <item>Use fixed-point (<c>FP64</c>) rather than <c>float</c>/<c>double</c> for any value that
 ///         crosses a tick boundary; IEEE results vary across platforms.</item>
 ///   <item>No parallel job execution (<c>JobExecution.Parallel</c>) — completion order is not
 ///         reproducible.</item>
-///   <item>No parent/child hierarchy (<c>AddChild</c>) and no <see cref="Script"/>s: that state
-///         lives outside the archetypes and is not captured by the snapshot.</item>
+///   <item>Keep simulation state <i>in the store</i>. A counter held in a system field is
+///         invisible to the snapshot, so a rollback rewinds the entities but not the counter and
+///         the replay takes different branches.</item>
 ///   <item>Create the store with the default <see cref="PidType.UsePidAsId"/>;
 ///         <see cref="PidType.RandomPids"/> seeds ids from a random source.</item>
 /// </list>
-/// Indexed components (<c>IIndexedComponent</c>) and relations (<c>IRelation</c>) are supported.
+/// Indexed components (<c>IIndexedComponent</c>), relations (<c>IRelation</c>), the parent/child
+/// hierarchy (<c>AddChild</c>) and <see cref="Script"/>s are all captured and restored.
 ///
 /// <b>Snapshot ring.</b> Following the Klotho contract, a snapshot saved at
 /// <see cref="SaveSnapshot"/> is keyed by the current <see cref="CurrentTick"/> and holds the

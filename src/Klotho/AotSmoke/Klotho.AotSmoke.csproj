@@ -1,0 +1,35 @@
+<!--
+  Klotho.AotSmoke — publishes as NativeAOT and exercises the bridge paths that need runtime type
+  inspection: relation components (which hold an Entity) and Scripts.
+
+  Its point is to prove those paths work with dynamic code disabled. Under NativeAOT
+  RuntimeFeature.IsDynamicCodeSupported is false, so DeterministicLayout interprets its plan
+  through reflection instead of compiling expression trees. A plain `dotnet test` run cannot
+  cover that: the JIT is always available there.
+
+  Not part of Engine.sln's default build — publishing AOT needs the C++ toolchain. Run it with:
+      dotnet publish src/Klotho/AotSmoke/Klotho.AotSmoke.csproj -r win-x64 -c Release
+-->
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <PublishAot>true</PublishAot>
+    <AssemblyName>Klotho.AotSmoke</AssemblyName>
+    <RootNamespace>Klotho.Friflo.AotSmoke</RootNamespace>
+    <IsPackable>false</IsPackable>
+    <!-- Surface every trim/AOT warning from the bridge and its dependencies. -->
+    <TrimmerSingleWarn>false</TrimmerSingleWarn>
+    <SelfContained>true</SelfContained>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Bridge\Klotho.Friflo.Bridge.csproj" />
+    <ProjectReference Include="..\..\ECS\Friflo.Engine.ECS.csproj" />
+  </ItemGroup>
+
+</Project>

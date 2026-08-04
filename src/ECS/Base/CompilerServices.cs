@@ -6,6 +6,7 @@ using System.Runtime.CompilerServices;
 [assembly: InternalsVisibleTo("Tests-internal")]
 [assembly: InternalsVisibleTo("Fliox.Tests-internal")]
 [assembly: InternalsVisibleTo("Klotho.Friflo.Bridge")]
+[assembly: InternalsVisibleTo("Klotho.Tests")]
 
 #if !NETCOREAPP3_0_OR_GREATER
 

@@ -30,8 +30,11 @@ namespace Klotho.Friflo;
 /// obtained from <c>store.extension.relationsMap</c>. Entity nodes never reference a relation
 /// archetype, so layer 3 only ever resolves indices into <c>store.archs[]</c>.</para>
 ///
-/// <para><b>Not covered</b> (see <see cref="FrifloSimulation"/> contract): parent/child hierarchy
-/// and <c>Script</c>s. A simulation store must not use <c>AddChild</c> or scripts.</para>
+/// <para><b>Hierarchy and scripts</b> are captured too, but neither fits the layers above:
+/// <c>parentMap</c> is a plain side array, while a <c>TreeNode</c>'s child list is an
+/// <c>IdArray</c> handle into a pooled allocator — the ids are captured separately and the pool
+/// is rebuilt on restore. Scripts are class instances, so their deterministic field values are
+/// captured and written back into the same instances.</para>
 /// </remarks>
 internal sealed class FrifloStoreSnapshot
 {
@@ -55,6 +58,22 @@ internal sealed class FrifloStoreSnapshot
 
     /// <summary>Scratch list of relation archetypes; reused so capture stays allocation-free.</summary>
     private readonly List<Archetype> relationArchetypes = new();
+
+    // --- hierarchy
+    /// <summary>Parent id per entity id.</summary>
+    private int[] parentMap   = new int[128];
+    private int   parentCount;
+    /// <summary>Child ids of every entity, packed back to back.</summary>
+    private int[] childIds    = new int[64];
+    /// <summary>Where entity id's children start in <see cref="childIds"/>.</summary>
+    private int[] childStarts = new int[128];
+    /// <summary>How many children entity id has.</summary>
+    private int[] childCounts = new int[128];
+
+    // --- scripts
+    /// <summary>One entry per script instance found in the store.</summary>
+    private ScriptState[] scriptStates = new ScriptState[8];
+    private int           scriptStateCount;
 
     /// <summary>True once <see cref="Capture"/> has run at least once.</summary>
     internal bool HasState { get; private set; }
@@ -86,6 +105,21 @@ internal sealed class FrifloStoreSnapshot
         internal int   isLinked;
     }
 
+    /// <summary>A script instance and the values of its deterministic fields.</summary>
+    private struct ScriptState
+    {
+        /// <summary>Entity the script is attached to.</summary>
+        internal int      entityId;
+        /// <summary>
+        /// The live instance. Scripts are reference types, so the snapshot keeps the identity and
+        /// restores the field values into it — replacing the object would invalidate references
+        /// the game holds.
+        /// </summary>
+        internal Script   script;
+        /// <summary>Deterministic field values of <see cref="script"/>.</summary>
+        internal ulong[]  leaves;
+    }
+
     // ------------------------------------------------------------------ capture
 
     /// <summary>Capture the current store state, overwriting any previously captured state.</summary>
@@ -94,7 +128,72 @@ internal sealed class FrifloStoreSnapshot
         CaptureArchetypes();
         CaptureRelationArchetypes();
         CaptureNodes();
+        CaptureHierarchy();
+        CaptureScripts();
         HasState = true;
+    }
+
+    /// <summary>
+    /// Capture the parent map and every entity's child ids.
+    /// </summary>
+    /// <remarks>
+    /// The child ids are captured as plain ints rather than by copying the <c>TreeNode</c>
+    /// components: those hold <c>IdArray</c> handles into a pooled allocator, whose offsets are
+    /// allocation history rather than state.
+    /// </remarks>
+    private void CaptureHierarchy()
+    {
+        int nodes = store.Capacity;
+        var source = store.GetParentMap();
+        if (parentMap.Length < nodes) {
+            Array.Resize(ref parentMap, nodes);
+        }
+        parentCount = Math.Min(source.Length, nodes);
+        Array.Copy(source, parentMap, parentCount);
+        for (int id = parentCount; id < nodes; id++) {
+            parentMap[id] = 0;      // Static.NoParentId
+        }
+        parentCount = nodes;
+
+        if (childStarts.Length < nodes) {
+            Array.Resize(ref childStarts, nodes);
+            Array.Resize(ref childCounts, nodes);
+        }
+        int total = 0;
+        for (int id = 0; id < nodes; id++) {
+            int count      = store.GetChildCount(id);
+            childStarts[id] = total;
+            childCounts[id] = count;
+            total          += count;
+        }
+        if (childIds.Length < total) {
+            Array.Resize(ref childIds, Math.Max(total, 2 * childIds.Length));
+        }
+        for (int id = 0; id < nodes; id++) {
+            if (childCounts[id] > 0) {
+                store.CopyChildIds(id, childIds, childStarts[id]);
+            }
+        }
+    }
+
+    /// <summary>Capture every script instance and its deterministic field values.</summary>
+    private void CaptureScripts()
+    {
+        int count = store.ScriptEntityCount;
+        int index = 0;
+        for (int n = 0; n < count; n++) {
+            store.GetScriptsAt(n, out int entityId, out var scripts);
+            foreach (var script in scripts) {
+                if (scriptStates.Length == index) {
+                    Array.Resize(ref scriptStates, Math.Max(4, 2 * index));
+                }
+                ref var state  = ref scriptStates[index++];
+                state.entityId = entityId;
+                state.script   = script;
+                ScriptLayout.Capture(script, ref state.leaves);
+            }
+        }
+        scriptStateCount = index;
     }
 
     private void CaptureArchetypes()
@@ -183,7 +282,35 @@ internal sealed class FrifloStoreSnapshot
         }
         RestoreArchetypes();
         RestoreNodes();
+        RestoreHierarchy();
+        RestoreScripts();
         RebuildLookupTables();
+    }
+
+    /// <summary>Restore the parent map and rebuild every child list from the captured ids.</summary>
+    private void RestoreHierarchy()
+    {
+        store.SetParentMap(parentMap, parentCount);
+        // Must run after RestoreNodes: it walks nodes to find each entity's TreeNode component.
+        store.RebuildChildHeap(childIds, childStarts, childCounts, parentCount);
+    }
+
+    /// <summary>
+    /// Restore script attachment and the field values of each script instance.
+    /// </summary>
+    /// <remarks>
+    /// Scripts are re-attached from scratch because a rollback can change which entity owns which
+    /// script. Field values are written back into the original instances, so references the game
+    /// holds to a script stay valid across a rollback.
+    /// </remarks>
+    private void RestoreScripts()
+    {
+        store.ClearScripts();
+        for (int i = 0; i < scriptStateCount; i++) {
+            ref var state = ref scriptStates[i];
+            ScriptLayout.Restore(state.script, state.leaves, store);
+            store.RestoreScript(state.entityId, state.script);
+        }
     }
 
     private void RestoreArchetypes()

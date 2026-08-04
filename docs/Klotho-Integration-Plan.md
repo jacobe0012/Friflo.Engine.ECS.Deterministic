@@ -9,7 +9,7 @@
 ## 实施结果（2026-08-04）
 
 **验收全部通过**：`dotnet build Engine.sln`（Debug + Release）0 错误；现有 `Tests` 656/656、
-`Tests-internal` 133/133 全绿；新增 `Klotho.Tests` 14/14 通过（连续 10 次运行稳定）。
+`Tests-internal` 133/133 全绿；新增 `Klotho.Tests` 50/50 通过。
 Klotho 源码经 `diff -r` 校验与上游**逐字节一致，改动 0 行**。
 
 ### 实施中推翻的三个方案假设
@@ -31,9 +31,32 @@ Klotho 源码经 `diff -r` 校验与上游**逐字节一致，改动 0 行**。
 
 示例最初把帧计数器放在 `SpawnSystem` 的字段里，`SyncTest` 立刻在 tick 5 报 desync——**存储之外的模拟状态回滚时不会被还原**。已改为 `SimClock` 组件存入 store。这正是该验证要抓的问题，保留在 `SampleSimulation.cs` 的注释中作为约束说明。
 
+### 第二轮补充（层级 / Script / NativeAOT）
+
+原方案把父子层级与 `Script` 列为"契约禁用"、NativeAOT 列为未验证。这三项已全部补齐：
+
+| 项 | 原状态 | 现状态 |
+|---|---|---|
+| 父子层级（`AddChild`） | ❌ 契约禁用 | ✅ 快照 `parentMap`，并从捕获的子 id 重建 `childHeap` |
+| `Script` | ❌ 契约禁用 | ✅ 保留实例身份，按类型计划存取其字段值 |
+| NativeAOT | ⚠️ 未验证 | ✅ 已实测（见下） |
+
+**层级的关键陷阱**：`TreeNode` 存的是 `IdArray`，即 `(start, count)` —— `start` 是**池分配器偏移**，属于分配历史而非状态。两端持有完全相同的树，偏移也可能不同。若照常按字节哈希，会报出并不存在的 desync。因此 `TreeNode` 改为**按子 id 内容哈希**，还原时重建整个池。已有测试 `StateHash_IsIndependentOfChildAllocatorHistory` 专门制造两端偏移不同的场景来钉死这点。
+
+**Script 的取舍**：Script 是 class，回滚时**保留原实例、只写回字段值**——若换成新对象，游戏代码持有的引用会全部失效。
+
+**NativeAOT 实测结论**：
+- 布局计划改为双路径：能生成代码时编译表达式树，`RuntimeFeature.IsDynamicCodeSupported == false` 时改用反射解释。原实现无条件用表达式树，AOT 下必然在第一次哈希时抛异常。
+- 新增 `src/Klotho/AotSmoke`（`PublishAot=true`，故 `IsDynamicCodeSupported` 实为 false），8 项检查全通过：关系回滚、Script 回滚、关系哈希按身份而非地址、全量状态往返。
+- ILC 分析：**19 条警告全部来自 `Friflo.Json.Fliox`（既有依赖），本次新增代码 0 条**。
+- 测试 `InterpretedHash_MatchesCompiledHash` 断言两条路径哈希一致——否则 AOT 客户端会与 JIT 客户端互相 desync。
+
+> **诚实边界**：本机 native 链接因缺 `vswhere.exe`（VS 工具链问题）未能产出 exe，故**未在真机原生二进制上跑过**。ILC 全量分析已完成且无本代码告警，反射路径也在 `IsDynamicCodeSupported=false` 下实测通过。
+
 ### 已知遗留
 
 - 单次 `Tests` 运行中曾出现 1 例失败，其后 15 次连续运行均 656/656 通过，**未能复现、未能定位到具体用例**，故如实记录而非判定为无害。
+- NativeAOT 未完成 native 链接产物验证（原因如上，属本机环境问题）。
 - 第二阶段（真实网络）尚未验证，风险 3 仍然成立。
 
 ## Context
@@ -201,12 +224,13 @@ TargetSystem : [IIndexedComponent] Team 按阵营查敌
 |---|---|
 | `indexMap`（索引组件） | ✅ **回滚后重建**（第 4 层） |
 | `relationsMap`（关系） | ✅ **数据在第 1 层，查找表回滚后重建** |
-| `parentMap` + `childHeap`（父子层级） | ❌ 不覆盖 → 契约禁用 |
-| `entityScripts` / `scriptMap`（Script） | ❌ 不覆盖 → 契约禁用 |
+| `parentMap` + `childHeap`（父子层级） | ✅ **已覆盖**（第二轮补充，见上） |
+| `entityScripts` / `scriptMap`（Script） | ✅ **已覆盖**（第二轮补充，见上） |
 | `pid2Id` / `id2Pid` | ✅ 不适用（默认 `UsePidAsId`，无此映射） |
 
-> **第一阶段契约：模拟 store 不得使用父子层级（`AddChild`）与 `Script`。**
-> 索引组件（`IIndexedComponent`）与关系（`IRelation`）**受支持**。
+> ~~第一阶段契约：模拟 store 不得使用父子层级（`AddChild`）与 `Script`。~~
+> **已作废**：层级与 Script 已在第二轮补齐。索引组件（`IIndexedComponent`）、关系
+> （`IRelation`）、父子层级与 `Script` **均受支持**。
 
 层级/Script 通常属于表现层而非确定性模拟层，故排除代价低。若后续模拟逻辑需要，第二阶段扩展快照器覆盖 `parentMap`/`childHeap`（`IdArrayHeap` 结构较复杂，工作量明显增加）。
 

@@ -112,7 +112,7 @@ public sealed class SpawnSystem : BaseSystem
 
     protected override void OnAddStore(EntityStore entityStore) => store = entityStore;
 
-    protected override void OnUpdateGroup()
+    protected internal override void OnUpdateGroup()
     {
         // The tick counter is read from the store, so a rollback rewinds it with everything else.
         var clockQuery = store.Query<SimClock>();
@@ -155,7 +155,7 @@ public sealed class TargetSystem : BaseSystem
 
     protected override void OnAddStore(EntityStore entityStore) => store = entityStore;
 
-    protected override void OnUpdateGroup()
+    protected internal override void OnUpdateGroup()
     {
         var query = store.Query<Team>();
         query.ForEachEntity((ref Team team, Entity entity) => {
