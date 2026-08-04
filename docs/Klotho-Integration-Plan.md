@@ -9,8 +9,9 @@
 ## 实施结果（2026-08-04）
 
 **验收全部通过**：`dotnet build Engine.sln`（Debug + Release）0 错误；现有 `Tests` 656/656、
-`Tests-internal` 133/133 全绿；新增 `Klotho.Tests` 50/50 通过；
-NativeAOT 真机二进制 8/8 通过（第三轮补测，见下）。
+`Tests-internal` 133/133 全绿；新增 `Klotho.Tests` **52/52** 通过；
+NativeAOT 真机二进制 8/8 通过（第三轮，见下）；
+**P2P 真实联机双引擎逐 verified-tick 哈希一致**（第四轮，见下）。
 Klotho 源码经 `diff -r` 校验与上游**逐字节一致，改动 0 行**。
 
 ### 实施中推翻的三个方案假设
@@ -105,11 +106,65 @@ echo $?   # 0 = 全部通过；非 0 即失败，可直接作构建门禁
 对 Friflo 既有文件的改动增加 1 处（`RegisterScript` 的注解，纯新增 attribute，
 不改变任何运行时行为，JIT 路径不受影响）。
 
+### 第四轮：真实联机（Phase 2，P2P）
+
+风险 3「网络层与桥接层的耦合面未验证」此前一直成立：`FrifloSimulation` 只在单进程直接调用下
+验证过，从未经过 `KlothoEngine`。本轮补齐。
+
+**结论：Klotho 源码仍 0 改动。** 关键在于 `RegisterSystems`（唯一形参为具体 `EcsSimulation`
+的回调）**引擎从不调用** —— 只有 `KlothoSession.Create` 和 `RoomManager` 调它。绕过前者、
+自写 session 组装，该耦合就根本不进入执行路径。另外 `_simulationCallbacks == null` 时引擎
+回退到无关类型的 `OnPreTick` 事件，故连 `ISimulationCallbacks` 都不必实现。
+
+新增 4 个文件（全部新增，未改动任何既有文件）：
+
+| 文件 | 作用 |
+|---|---|
+| `Bridge/FrifloKlothoSession.cs` | 替代 `KlothoSession.Create` 组装 CommandFactory + KlothoNetworkService + KlothoEngine + FrifloSimulation |
+| `Bridge/IFrifloSimulationCallbacks.cs` | Friflo 侧平行回调接口（`RegisterSystems(SystemRoot,EntityStore)` / `OnInitializeWorld` / `OnPollInput`），与 Klotho 的 `ISimulationCallbacks` 无继承关系 |
+| `Bridge/LoopbackTransport.cs` | 进程内 `INetworkTransport` 对，确定性投递，可注入按轮询计数的延迟 |
+| `Tests/Test_NetworkedDeterminism.cs` | 双引擎真实联机验证 |
+
+**实施中踩到并修掉的三个问题**（都是本次新代码的问题，非 Klotho 缺陷）：
+
+1. **`OnDataReceived` 的 peerId 语义**。它必须是**发送方在接收方视角下的 id**，且要与
+   `OnPeerConnected` 给出的 id 一致 —— host 用它在 `_pendingPeers` 里查握手状态
+   （`KlothoNetworkService.HandleDataReceived`）。最初写成了「接收方自己的 id」，
+   于是 host 收到 `PlayerJoinMessage` 却静默丢弃，握手永远停在 `Syncing`。
+2. **guest 不能在 `InitializeFromConnection` 之后再调 `JoinRoom`**。前者已把 phase 置为
+   `Synchronized`（接管已完成的握手），`JoinRoom` 会把它退回 `Lobby`，而 `SetReady` 在
+   非 `Synchronized` 下直接 return —— 比赛永远开不了。
+3. **世界初始化必须订阅 service 的 `OnGameStart` 而非 engine 的**。engine 的那个在
+   `Start()` 返回后才触发，那时 tick 0 已快照、首帧即将执行。订阅 service 的事件并抢在
+   `engine.Initialize` 之前，才等价于 Klotho 放 `OnInitializeWorld` 的位置。
+
+**验证做到什么程度**（刻意避免"绿了但什么都没验"）：
+
+- 走**真实握手**：`KlothoConnection.Connect` → PlayerJoin → 5 次 SyncRequest/Reply →
+  SyncComplete → host 下发权威 `SimulationConfig`。没有走任何测试专用捷径。
+- 比赛开始后给链路注入延迟，使一端的输入**赶不上**需要它的那一帧，从而真正触发
+  预测 → 判错 → 回滚重算。实测双方各 **10 次回滚、最大深度 5、0 次失败**。
+- **比对基准是 verified tick 而非 CurrentTick**。同一 `CurrentTick` 下两端状态本就可能
+  不同（一端还带着尚未纠正的错误预测），拿它比对会把正常预测误报成 desync。改为各自
+  记录「已确认且不会再改」的 tick 的哈希再交叉比对 —— 这也正是引擎自己发送 sync hash
+  的条件（`CurrentTick == _lastVerifiedTick + 1 && !_hasPendingRollback`）。
+  107 个共同 verified tick 全部一致。
+- 断言里显式钉死非空跑：比赛必须推进、必须有共同 verified tick、**双方回滚次数必须 > 0**。
+
+> **一处诚实修正**：`RollbackToTickZero_RestoresTheSeededWorld` 最初被描述为「能抓住
+> 世界初始化顺序写错」的回归测试。实测把该 bug 重新注入后**测试依然通过** —— 因为
+> `ExecuteTick` 在入口会用当前 tick 重新快照，首帧执行前就把 tick 0 的快照覆盖成了含
+> 世界的状态。故该测试实际覆盖的是「最深回滚（tick 0，跨引擎启动序列的那个快照）能正确
+> 还原」，不是顺序守卫。顺序仍按正确写法实现（不依赖这个巧合），注释已如实说明。
+
 ### 已知遗留
 
 - 单次 `Tests` 运行中曾出现 1 例失败，其后 15 次连续运行均 656/656 通过，**未能复现、未能定位到具体用例**，故如实记录而非判定为无害。
 - ~~NativeAOT 未完成 native 链接产物验证~~ **已完成**：真机二进制已产出并 8/8 通过（见「第三轮」）。仅在 `win-x64` 上验证过，其它 RID 未测。
-- 第二阶段（真实网络）尚未验证，风险 3 仍然成立。已确认的可行性前提：`KlothoEngine.Initialize` 接受 `ISimulation`（`KlothoEngine.cs:623/769`），且回滚主循环 `KlothoEngine.Rollback.cs` **零 `EcsSimulation` 耦合**；硬耦合集中在 `KlothoSession.Create`（`KlothoSession.cs:358` 直接 `new EcsSimulation`）与诊断/错误修正等旁路分支。方向：自写 session 组装绕过 `KlothoSession.Create`，保持 Klotho 源码 0 改动。
+- ~~第二阶段（真实网络）尚未验证，风险 3 仍然成立~~ **P2P 部分已验证**（见「第四轮」）。仍然遗留：
+  - **ServerDriven 模式未验证**。`RoomManager.cs:242` 同样硬构造 `EcsSimulation`，需要同类绕过；`ServerDrivenClientService` / `ServerNetworkService` 路径均未跑过。
+  - **仅内存传输**。`LoopbackTransport` 无丢包、无乱序、无 MTU 限制，故 Klotho 的重传/resync/FullState 恢复路径未被触发。真 UDP 双进程联机未验证。
+  - 仅两名玩家、单房间；late-join / reconnect / spectator 未验证。
 
 ## Context
 
