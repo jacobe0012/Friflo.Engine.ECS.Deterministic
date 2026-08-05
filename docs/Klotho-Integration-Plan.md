@@ -1,7 +1,7 @@
 # 将 Klotho 0.7.1（除 Godot 外）集成到 Friflo.Engine.ECS.Deterministic
 
 > 状态：**已实施**（分支 `feat/klotho-integration`）
-> 落档日期：2026-08-04，第六至九轮补充于 2026-08-05，第十轮（对抗性复核）2026-08-05
+> 落档日期：2026-08-04，第六至九轮补充于 2026-08-05，第十、十一轮（对抗性复核）2026-08-05
 > 来源：Klotho 0.7.1 @ `H:\Test\Git\Klotho-0.7.1`
 
 ---
@@ -9,7 +9,7 @@
 ## 实施结果（2026-08-04；第六至九轮 2026-08-05）
 
 **验收全部通过**：`dotnet build Engine.sln`（Debug + Release）0 错误；现有 `Tests` 656/656、
-`Tests-internal` 133/133 全绿；新增 `Klotho.Tests` **69/69** 通过（第十轮 +3）；
+`Tests-internal` 133/133 全绿；新增 `Klotho.Tests` **78/78** 通过（第十轮 +3，第十一轮 +12）；
 NativeAOT 真机二进制 12/12 通过（第三、五轮，见下）；
 **P2P 真实联机双引擎逐 verified-tick 哈希一致**（第四轮，见下）；
 **ServerDriven 服务端 + 双客户端逐 verified-tick 哈希一致**（第五轮，见下）；
@@ -23,7 +23,7 @@ Klotho 源码经 `diff -r` 校验与上游**逐字节一致，改动 0 行**。
 
 | # | 原方案假设 | 实测结果 | 采取的方案 |
 |---|---|---|---|
-| 1 | 对 Friflo 改动 **1 行**（`InternalsVisibleTo`）即可 | `EntityStore.intern`（含 `sequenceId`/`recycleIds`）与 `EntityStoreBase.archsCount` 是 **private**，`InternalsVisibleTo` 够不着 | 两者均为 `partial`，改用**新增文件** `DeterministicAccess.cs` 内部补充访问器。对既有文件的改动降到 **6 行 `partial` 关键字 + 1 行 `InternalsVisibleTo` + 4 处 `ClearIndex`/1 处 `RebuildLinkLookup` 新增方法**，共 43 行新增、6 行修改 |
+| 1 | 对 Friflo 改动 **1 行**（`InternalsVisibleTo`）即可 | `EntityStore.intern`（含 `sequenceId`/`recycleIds`）与 `EntityStoreBase.archsCount` 是 **private**，`InternalsVisibleTo` 够不着 | 两者均为 `partial`，改用**新增文件** `DeterministicAccess.cs` 内部补充访问器。对既有文件的改动降到 **6 行 `partial` 关键字 + 1 行 `InternalsVisibleTo` + 4 处 `ClearIndex`/1 处 `RebuildLinkLookup` 新增方法**，共 43 行新增、6 行修改（**第十一轮追加**：`IdArrayPool.Clear()` 与 `IdArrayHeap.Clear()` 两个新增方法，纯新增，既有路径不调用）|
 | 2 | 关系数据"已被原型快照覆盖" | **证伪**。`AbstractEntityRelations` 用 `new Archetype(config, heap)` 直接构造，**绕过 `AddArchetype`**，关系原型不在 `store.archs[]` 中（实测 `ArchetypeCount` 加关系后仍为 2，其 `archIndex` 越界） | 快照/哈希/序列化均**单独遍历** `extension.relationsMap[i].archetype` |
 | 3 | 组件"含引用字段会破坏快照"，故契约禁止 | 过严。`ILinkRelation` **必须**含 `Entity` 字段（它就是关系键），一刀切会让关系功能不可用。`Entity` 含 store 引用（进程相关），但其身份 `(Id, Revision)` 是确定的 | 新增 `DeterministicComponentLayout.cs`：按组件类型编译一次"叶子计划"，`Entity` 只贡献 `(Id, Revision)`、跳过 store 引用，还原时重新绑定到本地 store；含其它引用类型才报错 |
 
@@ -336,6 +336,10 @@ tick 上状态**都不相同**，且每个客户端拿到的世界带着自己�
 
 ### 第十轮：对抗性复核（位宽越界）
 
+> **第十一轮更正**：本轮把边界判定为 64 位，**不成立**。真实边界是 **32**——`EntityNode.isOwner`
+> 是 `int`，`indexBit`/`relationBit` 是 `(int)bitSet.l0`。本轮把桥接层拓到 256 位这件事本身是对的
+> （且是必要的），但「拓到 256 位就没有越界问题了」是错的。详见第十一轮。
+
 本轮不新增功能，只做一件事：**复核前九轮的声称是否属实**。逐项复跑全部验收命令，结论是
 前九轮记录的数字**全部复现**（构建 0 错误、`Tests` 656/656、`Tests-internal` 133/133、
 `Klotho.Tests` 66/66、AOT 真机 12/12、真 UDP 2 人局与 3 人局退出码 0）。
@@ -373,6 +377,79 @@ tick 上状态**都不相同**，且每个客户端拿到的世界带着自己�
 差异只剩下**新增项目自身**的告警（`Klotho.Tests` 3 条 CS0618/CS0649、
 `DeterministicComponentLayout.cs` 3 条 IL2026），既有项目**逐项一致**。
 
+### 第十一轮：对抗性复核（查找表的生命周期与越界的真实边界）
+
+本轮同样不新增功能，只复核。**前十轮的全部数字再次复现**（构建 0 错误、`Tests` 656/656、
+`Tests-internal` 133/133、AOT 真机 12/12、真 UDP 2 人局 799 tick / 3 人局 1200 tick 均退出码 0）。
+但查出**两处新缺陷**，并**推翻了第十轮对越界边界的判断**。
+
+#### 缺陷 1：回滚会永久泄漏池分配器（每次回滚一次，直到比赛结束）
+
+第 4 层「清空字典再重建」的写法漏掉了一件事：字典里存的 `IdArray` 是**池分配器的句柄**，而
+`IdArrayPool` 只有拿着 `start` 偏移显式 `DeleteArray` 才会回收。`Clear()` 一次性丢掉了所有句柄，
+于是**没有任何东西可以还给池子**——每次重建都从池子里取一段全新区域。四处都有：子实体池、
+索引 `idHeap`、关系 `idHeap`、链接关系 `linkIdsHeap`。全量状态还原走同一批例程，所以**每次 resync
+也泄漏一次**。
+
+实测（4 个子实体的 store）：10000 次回滚后池子从 96 字节涨到 262176 字节，`Count` 从 1 涨到 10001。
+约合**每千次回滚每个池子 26 KB**，且只增不减。
+
+**为什么前十轮一次都没碰到**：池偏移是分配历史，**被刻意排除在状态哈希之外**
+（正是 `StateHash_IsIndependentOfChildAllocatorHistory` 钉住的那条），所以两端始终一致；
+泄漏的内存**可达**，不是 GC 泄漏；而唯一的零分配断言覆盖的是 `SaveSnapshot`，泄漏发生在
+`Rollback`。它只表现为「客户端内存随预测失败次数上涨」——而预测失败正是网络越差越多。
+
+修法：给 `IdArrayPool` / `IdArrayHeap` 加 `Clear()`（保留 `ids` 缓冲，只重置 `count`/`freeStart`/
+`freeStarts`，所以重建路径仍然零分配），在三处重建入口调用。
+
+#### 缺陷 2：全量状态不清理载荷里没有的关系类型
+
+`ReadArchetypes` 早就有「本地有、载荷没有」的清空回合，但**关系原型不在 `store.archs[]` 里**
+（第一轮就记过：`AbstractEntityRelations` 绕过 `AddArchetype`），那个循环够不着它们，而
+`ReadRelations` 自己没有对应的回合。后果：SD 客户端 resync 时**保留自己旧世界的关系**——既进状态
+哈希，也进每一次关系查询。这是「用来终结分歧的机制本身制造了永久分歧」。
+
+> **一处必须记下的测试自身缺陷**：该回归测试最初的前置断言写成
+> `sender.GetRelations<Targeting>().Length == 0`。**光是这样问一句就会在发送端建出关系原型**，
+> 它随后以 0 实体随载荷过去，被 `ReadArchetype` 清掉——于是把修复 revert 掉**测试依然通过**。
+> 改为通过只读的 `GetRelationArchetypes` 检查发送端后，才真的失败。与第七轮的单子实体是同一类
+> 错误：断言用的动作本身改变了被测状态。
+
+#### 推翻第十轮：真实边界是 **32**，不是 64
+
+第十轮把桥接层从 64 位修到 256 位，并据此认为边界在 64。**实测证伪**：实体用
+`EntityNode.isOwner`（一个 **`int`**）记录自己拥有哪些索引组件与关系，而
+`indexBit`/`relationBit` 都是 `(int)ComponentTypes.bitSet.l0` —— 256 位集合被窄化成 32 位。
+逐类型实测（本仓库的 schema 已经越过这条线）：
+
+| structIndex | `DeleteEntity` 行为 |
+|---|---|
+| ≤ 30 | 正常清理索引 |
+| 31 | **抛 `NullReferenceException`**（符号位；`int`→`long` 符号扩展后高 32 位全 1，于是去遍历并不存在的组件类型） |
+| ≥ 32 | **静默留下陈旧索引项**（窄化成 0，实体被记成「什么都不拥有」，删除路径整段跳过） |
+
+**这是 Friflo 自身的限制，不是桥接层的**：不涉及任何模拟即可复现，修它要把 `isOwner`/`isLinked`
+在删除/索引/关系三条路径上全部拓宽成 `BitSet`，远超「不改引擎」的前提。桥接层能做的是**把边界
+测准并钉住**。实际含义：**一次确定性模拟中索引组件与关系类型合计不得超过 32 个**（含所有程序集、
+含测试夹具）。越过之后实体删除会破坏查找表，**而且状态哈希察觉不到**——又一个「哈希一致 ≠ 状态
+一致」的实例。
+
+顺带发现：`CreateEntity(签名)` 用的也是 `l0` 单字掩码，所以**结构序号 ≥ 64 的索引组件经签名创建时
+根本不进索引**，而回滚重建（已修成 256 位）会把它加进去——回滚**凭空造出**创建时不存在的索引项。
+本轮新测试因此一律走 `AddComponent`（它按 `StructInfo<T>.HasIndex` 逐类型判断，不受掩码影响）。
+
+| 新增测试 | 钉住的东西 | 已实测有效性 |
+|---|---|---|
+| `Test_LookupPoolReuse`（5 条增长守卫） | 子实体池 / 索引 / 关系 / 链接关系 / 全量状态路径的池必须复用 | 注入缺陷后 5 条全部失败 |
+| `Test_LookupPoolReuse.Rollback_KeepsLookupsIntactWhileReusingPools` | 复用池子不得损坏任何查找结果（哈希查不出来，只能读回列表） | 修复的正确性护栏 |
+| `Test_FullStateTransfer.FullState_DropsRelationsAbsentFromThePayload` | 载荷没有的关系类型必须被清掉 | 注入缺陷后失败 |
+| `Test_IndexedTypeCountLimit`（2 条） | 把 32 这条边界连同其算术根因钉成绊线：Friflo 一旦拓宽字段，测试失败，届时应重新测量 | 刻意断言**当前的错误行为** |
+
+回归：`dotnet build Engine.sln -t:Rebuild` 0 错误，**告警指纹与改动前逐项完全一致**
+（CS0618 32、IL2071 20、IL3050 12、IL2090 12、IL2026 6、CS0649 2，新增 0 条）；
+`Klotho.Tests` **78/78**（第十轮 66 + 本轮 12）；`Tests` 656/656、`Tests-internal` 133/133（1 skipped）；
+AOT 真机 12/12 退出码 0；真 UDP 2 人局与 3 人局退出码 0。
+
 ### 已知遗留
 
 - 单次 `Tests` 运行中曾出现 1 例失败，此后**累计 34 次连续运行**（28 次 Debug + 6 次
@@ -396,11 +473,20 @@ tick 上状态**都不相同**，且每个客户端拿到的世界带着自己�
   内存链路上的**模型**，不是真网络。
 - 第七轮的三条流程都只在**内存链路**上验证过，未与第六轮的劣化链路或第八轮的真 UDP 组合。
 - spectator 只验证了单个观战者；`MaxSpectators` 上限与多观战者未测。
-- **`BitSet` 的 256 位上限本身未测**。第十轮把桥接层从 64 位修到 256 位，但**超过 256 个
-  组件类型或 256 个 tag** 时 Friflo 自身即溢出（`BitSet` 注释写明「currently limited to
-  256 bits」），桥接层无法在其之上补救。到那一步需要先扩 Friflo 的 `BitSet`。
-- **第十轮只覆盖了「位宽」这一类越界**。同类问题的其余可能位置（例如各种以 `int` 为上限的
-  计数、`short revision` 的回绕）**未系统排查**——这是一次针对性复核，不是一次穷尽审计。
+- **索引组件与关系类型合计上限为 32**（第十一轮实测）。这是 Friflo `EntityNode.isOwner`（`int`）
+  的宽度所致，桥接层无法补救；越过后实体删除会破坏查找表且**状态哈希察觉不到**。
+  `Test_IndexedTypeCountLimit` 把这条边界钉成绊线。要突破需先把 Friflo 的
+  `isOwner`/`isLinked` 拓宽成 `BitSet`。
+- **`CreateEntity(签名)` 对结构序号 ≥ 64 的索引组件不建索引**（第十一轮实测，`l0` 单字掩码）。
+  同属 Friflo 自身问题。绕法是改用 `AddComponent`。**未修**——修它同样要动引擎。
+- **`BitSet` 的 256 位上限本身未测**。超过 256 个组件类型或 256 个 tag 时 Friflo 自身即溢出
+  （`BitSet` 注释写明「currently limited to 256 bits」）。不过在够到 256 之前，上面那条 32
+  的限制早就先撞上了。
+- **越界一类问题仍未穷尽排查**。第十轮查了位宽，第十一轮查了其中一处的真实边界与查找表生命周期；
+  其余可能位置（各种以 `int` 为上限的计数、`short revision` 的回绕）**仍未系统排查**——这两轮都是
+  针对性复核，不是穷尽审计。
+- **池分配器的复用只在回滚/全量还原路径上验证过**。第十一轮修的是重建入口；`IdArrayPool` 在
+  正常增删路径上的回收行为是 Friflo 既有逻辑，未在本项目中单独复核。
 
 ## Context
 
@@ -691,6 +777,14 @@ echo $?   # 必须为 0；--players 3 亦须通过
   （`structIndex >= 64` / `TagIndex >= 64`），否则填充类型一变就退化成在低位上做一件必然
   成立的事而依旧全绿。注意第 2 类（索引重建）**状态哈希察觉不到**——数据是对的，错的是
   查找表，只能靠按值查询的断言抓
+- **查找表的生命周期**（第十一轮追加）：凡是「清空字典再重建」的地方，都必须连同其
+  `IdArrayHeap` 一起重置——字典里存的是池句柄，清掉字典就再也还不回去了。断言方式是
+  **反复回滚后池子大小不变**（对比第一次重建后的基线，而非回滚前），单看一两次回滚看不出趋势。
+  另需一条正确性护栏读回子实体/索引/关系列表：**状态哈希对此无感**，它刻意不看池偏移
+- **测试的前置断言不得改变被测状态**（第十一轮追加）：`GetRelations<T>()` 这类「只是问一句」的
+  调用会**建出关系原型**，足以让一条回归测试在缺陷注入后依旧通过。前置检查要走只读入口
+- **越界边界必须实测而非推断**（第十一轮追加）：第十轮从「`BitSet` 是 256 位」推出边界在 64，
+  实测是 32（`isOwner` 是 `int`）。凡声称某个上限，都要有逐值扫描的实测支撑
 
 ---
 

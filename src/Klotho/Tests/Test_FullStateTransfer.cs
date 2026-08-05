@@ -140,6 +140,53 @@ public static class Test_FullStateTransfer
         }
     }
 
+    /// <summary>
+    /// A relation type the sender never used must not survive on the receiver.
+    /// </summary>
+    /// <remarks>
+    /// Full state replaces the world, so anything the payload does not mention has to go. The
+    /// archetype section already emptied every local archetype absent from the payload — but
+    /// relation archetypes are not in <c>store.archs[]</c> (<c>AbstractEntityRelations</c> builds
+    /// them directly, bypassing <c>AddArchetype</c>), so that loop never reached them and the
+    /// relation section had no clearing pass of its own.
+    ///
+    /// <para>The situation this models is the one a server-driven client is in when it resyncs
+    /// after diverging, or when it is moved between worlds: it holds relations of its own, and the
+    /// incoming state has none. The result was a client whose world silently kept them — in its
+    /// state hash, and in every relation query its systems ran — which is a permanent divergence
+    /// arriving through the very mechanism meant to end one.</para>
+    /// </remarks>
+    [Test]
+    public static void FullState_DropsRelationsAbsentFromThePayload()
+    {
+        // The sender never touches Targeting at all, so its payload carries no section for that
+        // relation type. Note what must NOT happen here: even *asking* an entity for its Targeting
+        // relations would create the relation archetype on the sender, which would then travel with
+        // an entity count of zero and get cleared on arrival by the archetype reader — leaving this
+        // test green regardless of the clearing pass it exists to cover. The sender is therefore
+        // checked through the store's relation archetypes, which is read-only.
+        var source = SampleSimulation.Create();
+        NewEntity(source.Store);
+        var senderRelations = new List<Archetype>();
+        source.Store.GetRelationArchetypes(senderRelations);
+        Assert.IsEmpty(senderRelations, "the sender was meant to have no relation archetypes at all");
+        var data = source.SerializeFullState();
+
+        var target   = SampleSimulation.Create();
+        var receiver = NewEntity(target.Store);
+        var other    = NewEntity(target.Store);
+        receiver.AddRelation(new Targeting { target = other });
+        Assert.AreEqual(1, receiver.GetRelations<Targeting>().Length, "the receiver was meant to hold a relation");
+
+        target.RestoreFromFullState(data);
+
+        var restored = new Entity(target.Store, receiver.Id, receiver.Revision);
+        Assert.AreEqual(0, restored.GetRelations<Targeting>().Length,
+            "a relation the sender never had survived the full-state restore");
+        Assert.AreEqual(source.GetStateHash(), target.GetStateHash(),
+            "restored state differs from the state that was sent");
+    }
+
     /// <summary>Add a child, then drop the oldest — so the child pool both grows and frees.</summary>
     private static void MutateHierarchy(EntityStore store, int parentId, int round)
     {

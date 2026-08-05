@@ -164,6 +164,13 @@ namespace Friflo.Engine.ECS
             var heap    = extension.childHeap;
             var treeHeap = (StructHeap<TreeNode>)null;
 
+            // Every child list is about to be rebuilt from scratch, so all current allocations
+            // become unreachable at once. Releasing them one by one is not possible: the handles
+            // live in the TreeNode components being overwritten, and an entity deleted since the
+            // capture no longer has a component to read its handle from. Left un-reset, the pool
+            // would hand out a fresh offset per rollback and grow for the whole match.
+            heap.Clear();
+
             for (int id = 0; id < nodeCount; id++) {
                 int count = childCounts[id];
                 ref var node = ref nodes[id];
@@ -177,7 +184,8 @@ namespace Friflo.Engine.ECS
                 }
                 treeHeap = (StructHeap<TreeNode>)heapEntry;
                 ref var treeNode = ref treeHeap.components[node.compIndex];
-                // Drop the stale handle before allocating a new one, so the pool does not leak.
+                // Clear the handle before allocating: the pool was just reset, so letting
+                // SetArray free the old one would decrement a count that is already zero.
                 treeNode.childIds = default;
                 if (count == 0) {
                     continue;
@@ -338,6 +346,13 @@ namespace Friflo.Engine.ECS
             }
             foreach (var index in indexMap) {
                 index?.ClearIndex();
+            }
+            // ClearIndex empties the value -> ids dictionaries, which drops the only references to
+            // the id arrays those dictionaries held. The arrays live in a pooled allocator that
+            // reclaims space only through an explicit delete, so without this the pool would grow
+            // by one allocation per indexed value per rollback and never shrink.
+            foreach (var index in indexMap) {
+                index?.ClearIdHeap();
             }
             // Re-register every indexed component from its archetype's component data.
             var schema = Static.EntitySchema;
@@ -594,6 +609,16 @@ namespace Friflo.Engine.ECS.Index
     {
         /// <summary>Remove all entries so the index can be rebuilt from component data.</summary>
         internal abstract void ClearIndex();
+
+        /// <summary>
+        /// Drop every id-array allocation backing this index.
+        /// </summary>
+        /// <remarks>
+        /// Must be called only together with <see cref="ClearIndex"/>, which discards the handles
+        /// into this pool. Defined here rather than per index type because
+        /// <see cref="AbstractComponentIndex.idHeap"/> is common to all of them.
+        /// </remarks>
+        internal void ClearIdHeap() => idHeap.Clear();
     }
 }
 
@@ -612,7 +637,16 @@ namespace Friflo.Engine.ECS.Relations
         internal void RebuildLookup()
         {
             positionMap.Clear();
-            linkEntityMap?.Clear();
+            // The cleared dictionaries held the only handles into these pools, so their
+            // allocations are now unreachable and can only be reclaimed wholesale. Skipping this
+            // leaks one allocation per relation-holding entity, per rollback, for the whole match.
+            idHeap.Clear();
+            if (linkEntityMap != null) {
+                // Only link relations maintain this map, and only they construct linkIdsHeap -
+                // on any other relation it is a default IdArrayHeap with no pools to clear.
+                linkEntityMap.Clear();
+                linkIdsHeap.Clear();
+            }
 
             int count   = archetype.entityCount;
             var ids     = archetype.entityIds;

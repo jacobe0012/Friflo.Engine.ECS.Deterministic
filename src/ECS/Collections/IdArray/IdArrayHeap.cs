@@ -26,6 +26,17 @@ internal readonly struct IdArrayHeap
 
     internal IdArrayPool GetPool        (int index) => pools[index];
     internal IdArrayPool GetOrCreatePool(int index) => pools[index] ??= new IdArrayPool(index);
+
+    /// <summary>
+    /// Drop every allocation in every pool. See <see cref="IdArrayPool.Clear"/>.
+    /// </summary>
+    /// <remarks> Used by the deterministic rollback bridge. See DeterministicAccess.cs. </remarks>
+    internal void Clear()
+    {
+        for (int n = 1; n < 32; n++) {
+            pools[n]?.Clear();
+        }
+    }
     
     private int GetCount()
     {

@@ -279,11 +279,31 @@ internal sealed class FrifloStateSerializer
         return result;
     }
 
+    /// <summary>
+    /// Recreate the serialized relation archetypes and empty every local one absent from the
+    /// payload.
+    /// </summary>
+    /// <remarks>
+    /// The clearing pass mirrors the one in <see cref="ReadArchetypes"/> and matters for the same
+    /// reason: a full state replaces the world, so a relation type the sender never used must not
+    /// survive on the receiver. It is easy to miss because relation archetypes live outside
+    /// <c>store.archs[]</c> — the loop over those does not reach them — and a server-driven client
+    /// that had been running a different world would otherwise keep its old relations, both in the
+    /// state hash and in every relation query.
+    /// </remarks>
     private void ReadRelations(BinaryReader reader)
     {
-        int count = reader.ReadInt32();
+        int count    = reader.ReadInt32();
+        var restored = new List<Archetype>(count);
         for (int i = 0; i < count; i++) {
-            ReadArchetype(reader, relation: true);
+            restored.Add(ReadArchetype(reader, relation: true));
+        }
+        var local = new List<Archetype>();
+        store.GetRelationArchetypes(local);
+        foreach (var archetype in local) {
+            if (!restored.Contains(archetype)) {
+                archetype.SetEntityCount(0);
+            }
         }
     }
 

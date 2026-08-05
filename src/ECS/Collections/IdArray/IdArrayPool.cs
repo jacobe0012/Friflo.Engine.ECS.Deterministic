@@ -63,6 +63,25 @@ internal sealed class IdArrayPool
     }
     
     /// <summary>
+    /// Drop every allocation, so the pool is empty again while keeping its backing array.
+    /// </summary>
+    /// <remarks>
+    /// Used by the deterministic rollback bridge. See DeterministicAccess.cs. A rollback rebuilds
+    /// the lookup structures that own these arrays wholesale, so the previous allocations are all
+    /// unreachable at once — but their handles live in the dictionaries being cleared, so there is
+    /// nothing left to call <see cref="DeleteArray"/> with. Without this the pool would hand out a
+    /// fresh start offset per rebuild and grow without bound for the life of the match.
+    /// <see cref="ids"/> and <see cref="maxStart"/> are deliberately kept: the next rebuild
+    /// allocates the same shapes again, and reusing the buffer keeps the path allocation-free.
+    /// </remarks>
+    internal void Clear()
+    {
+        count       = 0;
+        freeStart   = 0;
+        freeStarts.Clear();
+    }
+
+    /// <summary>
     /// Delete the array with the passed start index.
     /// </summary>
     internal void DeleteArray(int start, out int[] ids)
