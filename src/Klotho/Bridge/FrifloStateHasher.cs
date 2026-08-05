@@ -88,13 +88,18 @@ internal sealed class FrifloStateHasher
         ulong sum       = 0;
         var   entityIds = archetype.GetEntityIds();
         int   heapCount = archetype.GetHeapCount();
+        // All four words: a tag index of 64 or above lives outside the first one.
+        archetype.GetTagBits(out long tag0, out long tag1, out long tag2, out long tag3);
 
         for (int slot = 0; slot < count; slot++) {
             // Seed with the entity id and the archetype's tags so that moving an entity between
             // archetypes, or changing only its tags, still changes the hash.
             ulong hash = FnvOffset;
             Mix(ref hash, (ulong)(uint)entityIds[slot]);
-            Mix(ref hash, (ulong)archetype.GetTagBits());
+            Mix(ref hash, (ulong)tag0);
+            Mix(ref hash, (ulong)tag1);
+            Mix(ref hash, (ulong)tag2);
+            Mix(ref hash, (ulong)tag3);
 
             for (int heapIndex = 0; heapIndex < heapCount; heapIndex++) {
                 // Struct index identifies the component type independently of heap ordering.

@@ -1,7 +1,7 @@
 # 将 Klotho 0.7.1（除 Godot 外）集成到 Friflo.Engine.ECS.Deterministic
 
 > 状态：**已实施**（分支 `feat/klotho-integration`）
-> 落档日期：2026-08-04，第六至九轮补充于 2026-08-05
+> 落档日期：2026-08-04，第六至九轮补充于 2026-08-05，第十轮（对抗性复核）2026-08-05
 > 来源：Klotho 0.7.1 @ `H:\Test\Git\Klotho-0.7.1`
 
 ---
@@ -9,7 +9,7 @@
 ## 实施结果（2026-08-04；第六至九轮 2026-08-05）
 
 **验收全部通过**：`dotnet build Engine.sln`（Debug + Release）0 错误；现有 `Tests` 656/656、
-`Tests-internal` 133/133 全绿；新增 `Klotho.Tests` **66/66** 通过；
+`Tests-internal` 133/133 全绿；新增 `Klotho.Tests` **69/69** 通过（第十轮 +3）；
 NativeAOT 真机二进制 12/12 通过（第三、五轮，见下）；
 **P2P 真实联机双引擎逐 verified-tick 哈希一致**（第四轮，见下）；
 **ServerDriven 服务端 + 双客户端逐 verified-tick 哈希一致**（第五轮，见下）；
@@ -104,7 +104,8 @@ PATH="$PATH:/c/Program Files (x86)/Microsoft Visual Studio/Installer" \
 echo $?   # 0 = 全部通过；非 0 即失败，可直接作构建门禁
 ```
 
-回归：`dotnet build Engine.sln` 0 错误且**告警数与改动前逐项一致**（本次新增 0 条）；
+回归：`dotnet build Engine.sln` 0 错误且告警数与改动前逐项一致（本次新增 0 条）
+（**第十轮更正**：这条当时不成立，`DeterministicAccess.cs` 有 4 条 XML 文档告警未计入，见第十轮）；
 `Tests` 656/656、`Tests-internal` 133/133（1 skipped）、`Klotho.Tests` 50/50 全绿。
 对 Friflo 既有文件的改动增加 1 处（`RegisterScript` 的注解，纯新增 attribute，
 不改变任何运行时行为，JIT 路径不受影响）。
@@ -223,7 +224,8 @@ P2P 测试不受影响。
   重建客户端，**恢复之后哈希又一致了** —— 只比哈希会让「反复 desync 又反复被救」看起来全绿。
   实测把一个客户端的系统改成发散后，正是这条断言抓住了它。
 
-回归：`dotnet build Engine.sln` 0 错误，**告警指纹与改动前逐项完全一致**（新增 0 条）；
+回归：`dotnet build Engine.sln` 0 错误，告警指纹与改动前逐项完全一致（新增 0 条）
+（**第十轮更正**：同上，该说法当时不成立，已在第十轮修掉那 4 条告警后才为真）；
 `Klotho.Tests` 56/56、`Tests` 656/656、`Tests-internal` 133/133（1 skipped）全绿；
 AOT 真机二进制 **12/12 通过，退出码 0**（新增 4 项，覆盖本轮新增的
 「按运行期类型发现 Script 字段」的全量状态路径 —— 正是第三轮踩过的 ILC 裁剪坑）。
@@ -332,6 +334,45 @@ Klotho 的多房间栈有四块，其中**三块可以直接用**：`RoomRouter`
 tick 上状态**都不相同**，且每个客户端拿到的世界带着自己房间的 tag。把所有客户端都指向房间 0
 会失败——房间 0 以满员拒绝它们。
 
+### 第十轮：对抗性复核（位宽越界）
+
+本轮不新增功能，只做一件事：**复核前九轮的声称是否属实**。逐项复跑全部验收命令，结论是
+前九轮记录的数字**全部复现**（构建 0 错误、`Tests` 656/656、`Tests-internal` 133/133、
+`Klotho.Tests` 66/66、AOT 真机 12/12、真 UDP 2 人局与 3 人局退出码 0）。
+
+但**查出两处此前所有测试都够不到的缺陷**，同属一类：`BitSet` 是 **256 位**（`l0..l3`
+四个字），而桥接层三处只读写了 `l0`。
+
+| # | 位置 | 后果 | 为何九轮都没抓到 |
+|---|---|---|---|
+| 1 | `Archetype.GetTagBits()` → 状态哈希 + 全量状态 | tag 序号 ≥ 64 时：两端 tag 不同而**哈希相同**（desync 永不上报）；SD 客户端从全量状态重建的世界**丢掉该 tag**，从此匹配到不同的 query | 全部测试加起来的 tag 数远不到 64 |
+| 2 | `RebuildIndexes()` 的 `componentTypes & indexTypes` 交集 | 索引组件序号 ≥ 64 时，回滚**跳过**它的索引重建：组件值正确还原、**哈希也一致**，只有按值查询返回被回滚掉的实体 | schema 把索引组件排在最前，要 64 个索引类型才够到边界 |
+
+第 2 条尤其安静：**状态哈希察觉不到它**。数据是对的，错的是查找表，于是分歧通过系统走到
+不同分支体现出来，而不是通过哈希。这正是「哈希一致」不等于「状态一致」的一个实例。
+
+修法是把三处都改成读写四个字。`GetTagBits` 改为 `out` 四个 long；`GetArchetypeByContent`
+同样收四个；全量状态**格式版本 2 → 3**（archetype 头部的 tag 字段从 1 个 long 变成 4 个，
+混用会从该字段起整段错位）。
+
+两条回归都**按本项目标准实测过有效性**——把缺陷重新注入后分别以
+「state hash ignores tag 'Tag62' (index 64)」和「index lookup ... missed the entity」失败：
+
+| 新增测试 | 钉住的东西 |
+|---|---|
+| `Test_TagBits.StateHash_SeesTagsBeyondTheFirstBitSetWord` | 高位 tag 必须改变哈希 |
+| `Test_TagBits.FullState_CarriesTagsBeyondTheFirstBitSetWord` | 高位 tag 必须随全量状态过去 |
+| `Test_IndexRebuildWidth.Rollback_RebuildsIndexesForHighStructIndexComponents` | 高位索引组件回滚后按值查询必须正确 |
+
+两个测试都**先断言自己确实越过了边界**（`structIndex >= 64`），否则填充类型数量一变，
+测试会退化成在低位上做一件必然成立的事而依旧全绿。
+
+**顺带订正一处不实记载**：前九轮反复声称「告警指纹与改动前逐项完全一致（新增 0 条）」。
+实测**不成立**——`DeterministicAccess.cs` 有 4 条 XML 文档告警（CS1574 ×2、CS1734 ×2），
+其中一条是一个 `<summary>` 落到了错误的成员上。已修掉，现在该说法才为真。当前与改动前的
+差异只剩下**新增项目自身**的告警（`Klotho.Tests` 3 条 CS0618/CS0649、
+`DeterministicComponentLayout.cs` 3 条 IL2026），既有项目**逐项一致**。
+
 ### 已知遗留
 
 - 单次 `Tests` 运行中曾出现 1 例失败，此后**累计 34 次连续运行**（28 次 Debug + 6 次
@@ -355,6 +396,11 @@ tick 上状态**都不相同**，且每个客户端拿到的世界带着自己�
   内存链路上的**模型**，不是真网络。
 - 第七轮的三条流程都只在**内存链路**上验证过，未与第六轮的劣化链路或第八轮的真 UDP 组合。
 - spectator 只验证了单个观战者；`MaxSpectators` 上限与多观战者未测。
+- **`BitSet` 的 256 位上限本身未测**。第十轮把桥接层从 64 位修到 256 位，但**超过 256 个
+  组件类型或 256 个 tag** 时 Friflo 自身即溢出（`BitSet` 注释写明「currently limited to
+  256 bits」），桥接层无法在其之上补救。到那一步需要先扩 Friflo 的 `BitSet`。
+- **第十轮只覆盖了「位宽」这一类越界**。同类问题的其余可能位置（例如各种以 `int` 为上限的
+  计数、`short revision` 的回绕）**未系统排查**——这是一次针对性复核，不是一次穷尽审计。
 
 ## Context
 
@@ -638,7 +684,13 @@ echo $?   # 必须为 0；--players 3 亦须通过
   真的失败。本轮据此发现 late-join 测试用单个子实体时，把子实体池重建删掉**依然通过**
   （`IdArray` 在 `count == 1` 时不碰池分配器）
 - **告警指纹不变**：`dotnet build Engine.sln` 除 0 错误外，按告警码分类计数须与改动前逐项一致
-  （新增 0 条）。只看「0 错误」会放过新引入的告警
+  （既有项目新增 0 条）。只看「0 错误」会放过新引入的告警。**必须 `-t:Rebuild` 后比较**：
+  增量构建只重编改动过的 TFM，计数会随上次构建的残留而漂移，看起来像凭空多出或少掉告警
+- **位宽越界**（第十轮追加）：凡是把 `BitSet`（tag / 组件类型，各 **256 位**）搬进哈希、
+  全量状态或索引重建的地方，都必须取满四个字。测试须**先断言自己确实越过了 64 位边界**
+  （`structIndex >= 64` / `TagIndex >= 64`），否则填充类型一变就退化成在低位上做一件必然
+  成立的事而依旧全绿。注意第 2 类（索引重建）**状态哈希察觉不到**——数据是对的，错的是
+  查找表，只能靠按值查询的断言抓
 
 ---
 

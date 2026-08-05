@@ -31,10 +31,12 @@ namespace Klotho.Friflo;
 internal sealed class FrifloStateSerializer
 {
     /// <summary>
-    /// Bumped from 1 when the hierarchy and script sections were added: a peer reading the old
-    /// format would silently build a world with no scripts and a broken child pool.
+    /// Version 2 added the hierarchy and script sections: a peer reading version 1 would silently
+    /// build a world with no scripts and a broken child pool. Version 3 widened the archetype tag
+    /// field from one 64-bit word to all four, so a peer mixing the two would misread every
+    /// archetype header from that field onwards.
     /// </summary>
-    private const int FormatVersion = 2;
+    private const int FormatVersion = 3;
 
     private readonly EntityStore store;
 
@@ -104,7 +106,13 @@ internal sealed class FrifloStateSerializer
         int heapCount   = archetype.GetHeapCount();
 
         // Identify the archetype by content, not by index: the receiving store may not have it.
-        writer.Write(archetype.GetTagBits());
+        // All four tag words travel: an index of 64 or above lives outside the first one, and a
+        // dropped tag changes which queries match the entity on the receiving side.
+        archetype.GetTagBits(out long tag0, out long tag1, out long tag2, out long tag3);
+        writer.Write(tag0);
+        writer.Write(tag1);
+        writer.Write(tag2);
+        writer.Write(tag3);
         writer.Write(heapCount);
         for (int h = 0; h < heapCount; h++) {
             writer.Write(archetype.GetHeapStructIndex(h));
@@ -281,7 +289,10 @@ internal sealed class FrifloStateSerializer
 
     private Archetype ReadArchetype(BinaryReader reader, bool relation)
     {
-        long tagBits   = reader.ReadInt64();
+        long tag0      = reader.ReadInt64();
+        long tag1      = reader.ReadInt64();
+        long tag2      = reader.ReadInt64();
+        long tag3      = reader.ReadInt64();
         int  heapCount = reader.ReadInt32();
         var  structIndices = new int[heapCount];
         for (int h = 0; h < heapCount; h++) {
@@ -290,7 +301,7 @@ internal sealed class FrifloStateSerializer
         // Resolving by content creates the archetype locally when the receiver has never used it.
         var archetype = relation
             ? store.GetRelationArchetype(structIndices[0])
-            : store.GetArchetypeByContent(structIndices, tagBits);
+            : store.GetArchetypeByContent(structIndices, tag0, tag1, tag2, tag3);
 
         int entityCount = reader.ReadInt32();
         archetype.EnsureCapacity(entityCount);

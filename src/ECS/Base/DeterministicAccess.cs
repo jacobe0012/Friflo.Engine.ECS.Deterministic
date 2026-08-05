@@ -108,8 +108,8 @@ namespace Friflo.Engine.ECS
         /// </summary>
         /// <remarks>
         /// Relation archetypes are created by <see cref="AbstractEntityRelations"/> without going
-        /// through <see cref="AddArchetype"/>, so they are NOT present in <see cref="archs"/> and
-        /// must be enumerated separately when capturing state.
+        /// through <c>EntityStoreBase.AddArchetype</c>, so they are NOT present in
+        /// <c>EntityStoreBase.archs</c> and must be enumerated separately when capturing state.
         /// </remarks>
         internal void GetRelationArchetypes(List<Archetype> result)
         {
@@ -198,10 +198,10 @@ namespace Friflo.Engine.ECS
             return ((StructHeap<TreeNode>)heapEntry).components[node.compIndex].childIds.count;
         }
 
-        /// <summary>Copy the child ids of entity <paramref name="id"/> into <paramref name="target"/>.</summary>
         /// <summary>The pool backing every <see cref="TreeNode"/> child list.</summary>
         internal Collections.IdArrayHeap GetChildHeap() => extension.childHeap;
 
+        /// <summary>Copy the child ids of entity <paramref name="id"/> into <paramref name="target"/>.</summary>
         internal void CopyChildIds(int id, int[] target, int targetOffset)
         {
             ref var node  = ref nodes[id];
@@ -282,21 +282,27 @@ namespace Friflo.Engine.ECS
 
     #region archetype lookup
         /// <summary>
-        /// Return the archetype holding exactly <paramref name="structIndices"/> and
-        /// <paramref name="tagBits"/>, creating it if this store has not used it yet.
+        /// Return the archetype holding exactly <paramref name="structIndices"/> and the tags in
+        /// <paramref name="l0"/>..<paramref name="l3"/>, creating it if this store has not used it
+        /// yet.
         /// </summary>
         /// <remarks>
         /// Used when restoring a full state produced by another peer, which may have archetypes
-        /// this store has never created.
+        /// this store has never created. All four tag words are taken: a tag index of 64 or above
+        /// lives outside the first, and dropping it would rebuild the entity under different tags
+        /// than the sender had, so it would match different queries.
         /// </remarks>
-        internal Archetype GetArchetypeByContent(int[] structIndices, long tagBits)
+        internal Archetype GetArchetypeByContent(int[] structIndices, long l0, long l1, long l2, long l3)
         {
             var componentTypes = new ComponentTypes();
             foreach (var structIndex in structIndices) {
                 componentTypes.bitSet.SetBit(structIndex);
             }
             var tags = new Tags();
-            tags.bitSet.l0 = tagBits;
+            tags.bitSet.l0 = l0;
+            tags.bitSet.l1 = l1;
+            tags.bitSet.l2 = l2;
+            tags.bitSet.l3 = l3;
             return GetArchetype(componentTypes, tags);
         }
 
@@ -341,8 +347,17 @@ namespace Friflo.Engine.ECS
                 if (count == 0) {
                     continue;
                 }
+                // All four words: struct indices run to 256, so intersecting only the first would
+                // silently skip any indexed component numbered 64 or above. Its values would
+                // restore correctly while its index kept entries from the abandoned timeline —
+                // visible only as queries returning the wrong entities, never as a hash mismatch.
                 var indexTypes = new ComponentTypes();
-                indexTypes.bitSet.l0 = archetype.componentTypes.bitSet.l0 & schema.indexTypes.bitSet.l0;
+                var archBits   = archetype.componentTypes.bitSet;
+                var indexBits  = schema.indexTypes.bitSet;
+                indexTypes.bitSet.l0 = archBits.l0 & indexBits.l0;
+                indexTypes.bitSet.l1 = archBits.l1 & indexBits.l1;
+                indexTypes.bitSet.l2 = archBits.l2 & indexBits.l2;
+                indexTypes.bitSet.l3 = archBits.l3 & indexBits.l3;
                 foreach (var componentType in indexTypes) {
                     var heap = archetype.heapMap[componentType.StructIndex];
                     heap.AddIndexRange(this, archetype.entityIds, count);
@@ -434,8 +449,21 @@ namespace Friflo.Engine.ECS
             return hash;
         }
 
-        /// <summary>Tag bits of this archetype.</summary>
-        internal long GetTagBits() => tags.bitSet.l0;
+        /// <summary>All four words of this archetype's tag bits.</summary>
+        /// <remarks>
+        /// Tag indices are allocated per schema across every assembly it sees, so the 64th tag
+        /// declared anywhere lands outside the first word. Returning only <c>l0</c> would make
+        /// every higher tag invisible to the state hash and absent from a serialized world — two
+        /// peers disagreeing about one would agree on the hash and never report the desync.
+        /// </remarks>
+        internal void GetTagBits(out long l0, out long l1, out long l2, out long l3)
+        {
+            var bitSet = tags.bitSet;
+            l0 = bitSet.l0;
+            l1 = bitSet.l1;
+            l2 = bitSet.l2;
+            l3 = bitSet.l3;
+        }
 
         /// <summary>Raw bytes of the first <paramref name="count"/> components of heap <paramref name="heapIndex"/>.</summary>
         internal byte[] GetHeapComponentBytes(int heapIndex, int count)
