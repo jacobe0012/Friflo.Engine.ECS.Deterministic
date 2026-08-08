@@ -62,7 +62,7 @@ Neither assembly bundles its NuGet dependencies. Install via NuGetForUnity (or e
 
 | Assembly | Needs |
 |---|---|
-| `Friflo.Engine.ECS` | `Friflo.Json.Fliox` 1.0.4, `Friflo.Json.Fliox.Annotation` 1.0.4, `Friflo.Json.Burst` 1.0.4 |
+| `Friflo.Engine.ECS` | `Friflo.Json.Fliox` 1.0.4, `Friflo.Json.Fliox.Annotation` 1.0.4, `Friflo.Json.Burst` 1.0.4, `System.Runtime.CompilerServices.Unsafe` 6.0.0 |
 | `Klotho.Runtime` | `Newtonsoft.Json` (`com.unity.nuget.newtonsoft-json` works) |
 
 `System.ComponentModel.Annotations` is deliberately *not* on that list. `DataEntity.pid` carries a
