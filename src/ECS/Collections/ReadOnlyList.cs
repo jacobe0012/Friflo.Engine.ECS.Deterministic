@@ -75,7 +75,8 @@ public struct ReadOnlyList<T> : IReadOnlyList<T>
 
 
         public Mutate() {
-            list = new ReadOnlyList<T>([]);
+            // See EntityStore.userDataSlots: no C# 12 collection expressions, Unity's Roslyn is older.
+            list = new ReadOnlyList<T>(Array.Empty<T>());
         }
             
         public Mutate(T[] array) {

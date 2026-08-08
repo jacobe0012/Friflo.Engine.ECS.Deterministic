@@ -24,6 +24,14 @@ src/Tests~/**/*.meta
 src/ECS/**/*.meta
 src/Klotho/**/*.meta
 
+## One exception, and it has to be one: KlothoGenerator.dll is a Roslyn source generator, and the
+## ONLY place Unity records "run this as a generator" is the RoslynAnalyzer label inside its .meta.
+## Without this file committed, a fresh clone imports the DLL as an inert plugin, the generator
+## never runs, and every [KlothoSerializable] type fails to compile with "does not implement
+## inherited abstract member" — ~550 errors that look nothing like the actual cause.
+## Its guid is fixed here rather than left to Unity so it stays stable across clones.
+!src/Klotho/Analyzers/KlothoGenerator.dll.meta
+
 *.DotSettings.user
 
 ## Editor

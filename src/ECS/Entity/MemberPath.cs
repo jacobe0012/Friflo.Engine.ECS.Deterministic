@@ -163,19 +163,22 @@ public sealed class MemberPath
         }
         
         var typeParams  = new []{ type, memberType };
+        // new[]{...} rather than `[...]` collection expressions: Unity 6000.0 ships a Roslyn that
+        // predates C# 12, and this repository is compiled from source inside a Unity project.
+        var factoryArgTypes = new [] { typeof(string), typeof(MemberInfo[]) };
         Delegate getter = null;
         if (canRead) {
             var name 		    = path == "" ? $"get: ({type.Name} => this)" :  $"get: ({type.Name} => {path})";
-            var getterMethod    = typeof(MemberPath).GetMethod("CreateGetter", BindingFlags.Static | BindingFlags.NonPublic, null, [typeof(string), typeof(MemberInfo[])], null)!;
+            var getterMethod    = typeof(MemberPath).GetMethod("CreateGetter", BindingFlags.Static | BindingFlags.NonPublic, null, factoryArgTypes, null)!;
             var genericGetter   = getterMethod.MakeGenericMethod(typeParams);
-            getter              = (Delegate)genericGetter.Invoke(null, [name, memberInfos]);
+            getter              = (Delegate)genericGetter.Invoke(null, new object[] { name, memberInfos });
         }
         Delegate setter = null;
         if (canWrite) {
             var name 		    = path == "" ? $"set: ({type.Name} => this)" :  $"set: ({type.Name} => {path})";
-            var setterMethod    = typeof(MemberPath).GetMethod("CreateSetter", BindingFlags.Static | BindingFlags.NonPublic, null, [typeof(string), typeof(MemberInfo[])], null)!;
+            var setterMethod    = typeof(MemberPath).GetMethod("CreateSetter", BindingFlags.Static | BindingFlags.NonPublic, null, factoryArgTypes, null)!;
             var genericSetter   = setterMethod.MakeGenericMethod(typeParams);
-            setter              = (Delegate)genericSetter.Invoke(null, [name, memberInfos]);
+            setter              = (Delegate)genericSetter.Invoke(null, new object[] { name, memberInfos });
         }
         var structIndex = 0;
         if (EntityStoreBase.Static.EntitySchema.ComponentTypeByType.TryGetValue(type, out var componentType)) {

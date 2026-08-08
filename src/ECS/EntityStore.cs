@@ -117,7 +117,9 @@ public sealed partial class EntityStore : EntityStoreBase
     
     [Browse(Never)]
     [EditorBrowsable(EditorBrowsableState.Never)]
-    private object[] userDataSlots = [];
+    // Array.Empty<>() rather than a `[]` collection expression: Unity 6000.0 ships a Roslyn that
+    // predates C# 12, and this repository is compiled from source inside a Unity project.
+    private object[] userDataSlots = Array.Empty<object>();
     
     [Browse(Never)]
     private static int UserDataMaxSlot;

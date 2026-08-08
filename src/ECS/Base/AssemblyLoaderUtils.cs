@@ -12,8 +12,11 @@ internal static class AssemblyLoaderUtils
     //
     // Ignore checking system assemblies for having component or tag types.
     // These assemblies are dependencies for the ECS and cannot have these types.
-    internal static readonly HashSet<string> SystemAssemblyNames =
-    [
+    // `new HashSet<string> { ... }` rather than a `[...]` collection expression: Unity 6000.0
+    // ships a Roslyn that predates C# 12, and this repository is compiled from source inside a
+    // Unity project. Same reason as EntityStore.userDataSlots.
+    internal static readonly HashSet<string> SystemAssemblyNames = new HashSet<string>
+    {
         "Microsoft.CSharp",
         "Microsoft.Win32.Primitives",
         "Microsoft.Win32.Registry",
@@ -118,5 +121,5 @@ internal static class AssemblyLoaderUtils
         "System.Xml.XmlSerializer",
         
         "netstandard"
-    ];
+    };
 }
