@@ -3,8 +3,13 @@
   Deterministic math/physics, Diagnostics), mirroring the upstream Server~ assembly boundaries.
 
   Excludes (each is engine/json-coupled or a separate upstream assembly):
-    **/Json/**   DataAsset.Json subtree (Unity/json-coupled)
-    Plugins/**   optional MEL logging adapter (needs Microsoft.Extensions.Logging)
+    **/Json~/**   DataAsset.Json subtree (Unity/json-coupled)
+    Plugins~/**   optional MEL logging adapter (needs Microsoft.Extensions.Logging)
+
+  The `~` suffix is Unity's "do not import" marker: this repository is consumed as a git
+  submodule placed under a Unity project's Assets/, where Unity compiles every .cs it finds.
+  Directories that must not reach Unity carry the suffix, so the exclude patterns below match
+  the on-disk names. Renaming one without updating the other silently pulls the tree back in.
 
   Unlike upstream, Logging / Gameplay / LiteNetLib / ThirdParty are compiled into this single
   assembly instead of separate ones: the bridge only needs one reference, and KlothoGenerator
@@ -40,8 +45,8 @@
     <!-- The intermediate/output dirs live under this folder and hold generated .cs
          (AssemblyInfo etc.), so they must be excluded or their attributes are compiled twice. -->
     <Compile Include="$(MSBuildThisFileDirectory)**\*.cs"
-             Exclude="$(MSBuildThisFileDirectory)**\Json\**\*.cs;
-                      $(MSBuildThisFileDirectory)Plugins\**\*.cs;
+             Exclude="$(MSBuildThisFileDirectory)**\Json~\**\*.cs;
+                      $(MSBuildThisFileDirectory)Plugins~\**\*.cs;
                       $(MSBuildThisFileDirectory).obj\**\*.cs;
                       $(MSBuildThisFileDirectory)bin\**\*.cs" />
   </ItemGroup>

@@ -1,6 +1,6 @@
-<!--
+﻿<!--
   Klotho.Tests — determinism / rollback verification for the Friflo <-> Klotho bridge.
-  NUnit 3 to match the convention of src/Tests/Tests.csproj.
+  NUnit 3 to match the convention of src/Tests~/Tests.csproj.
 -->
 <Project Sdk="Microsoft.NET.Sdk">
 

@@ -1,4 +1,4 @@
-<!--
+﻿<!--
   Klotho.AotSmoke — publishes as NativeAOT and exercises the bridge paths that need runtime type
   inspection: relation components (which hold an Entity) and Scripts.
 
@@ -17,8 +17,8 @@
   into the linker path, which reads like a missing toolchain rather than a missing PATH entry.
 
       PATH="$PATH:/c/Program Files (x86)/Microsoft Visual Studio/Installer" \
-        dotnet publish src/Klotho/AotSmoke/Klotho.AotSmoke.csproj -r win-x64 -c Release
-      ./src/Klotho/AotSmoke/bin/Release/net8.0/win-x64/publish/Klotho.AotSmoke.exe
+        dotnet publish src/Klotho/AotSmoke~/Klotho.AotSmoke.csproj -r win-x64 -c Release
+      ./src/Klotho/AotSmoke~/bin/Release/net8.0/win-x64/publish/Klotho.AotSmoke.exe
       echo $?   # 0 = all checks passed
 -->
 <Project Sdk="Microsoft.NET.Sdk">

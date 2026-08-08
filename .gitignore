@@ -10,7 +10,19 @@ obj/
 
 
 !**/*.meta
-src/Tests/**/*.meta
+src/Tests~/**/*.meta
+
+## Unity-generated .meta for the source this branch exposes to a Unity project.
+## This repository is consumed as a git submodule under a Unity project's Assets/, so Unity
+## generates a .meta next to every file it imports. Those belong to the consuming project, not
+## here — committing them would make every `git pull` in the submodule conflict with whatever
+## the local Unity happened to generate.
+##
+## Consequence to know about: the guids are NOT stable across clones. Any .asmdef in the
+## consuming project that references these assemblies must reference them BY NAME, never by
+## "GUID:...", or the reference silently breaks on a fresh clone.
+src/ECS/**/*.meta
+src/Klotho/**/*.meta
 
 *.DotSettings.user
 

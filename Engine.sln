@@ -5,25 +5,25 @@ VisualStudioVersion = 17.0.31903.59
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Friflo.Engine.ECS", "src\ECS\Friflo.Engine.ECS.csproj", "{BC0E03EC-91A5-4777-9D52-464FD10170AF}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Engine.Hub", "src\Hub\Engine.Hub.csproj", "{1C33A81E-E654-40DC-94A5-27A8765E65B0}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Engine.Hub", "src\Hub~\Engine.Hub.csproj", "{1C33A81E-E654-40DC-94A5-27A8765E65B0}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Tests", "src\Tests\Tests.csproj", "{C224813F-2372-4879-B661-5F00FD947938}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Tests", "src\Tests~\Tests.csproj", "{C224813F-2372-4879-B661-5F00FD947938}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Tests-internal", "src\Tests-internal\Tests-internal.csproj", "{9A5375A3-8D38-48CA-BBF0-5338A4811FDB}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Tests-internal", "src\Tests-internal~\Tests-internal.csproj", "{9A5375A3-8D38-48CA-BBF0-5338A4811FDB}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Editor", "src\apps\Editor\Editor.csproj", "{EABD51D9-E768-4DCA-B2F4-5650AA7547DD}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Editor", "src\apps~\Editor\Editor.csproj", "{EABD51D9-E768-4DCA-B2F4-5650AA7547DD}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Engine.OpenGL", "src\apps\OpenGL\Engine.OpenGL.csproj", "{A941382D-5C4A-48D4-B7A6-D0F72AA4DC41}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Engine.OpenGL", "src\apps~\OpenGL\Engine.OpenGL.csproj", "{A941382D-5C4A-48D4-B7A6-D0F72AA4DC41}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "GameTest", "src\apps\GameTest\GameTest.csproj", "{A28046BA-D99F-46F4-8027-3333E405A71E}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "GameTest", "src\apps~\GameTest\GameTest.csproj", "{A28046BA-D99F-46F4-8027-3333E405A71E}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Editor.UI", "src\apps\Editor.UI\Editor.UI.csproj", "{14EADD4E-A06E-4E56-9D28-C616D33108EB}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Editor.UI", "src\apps~\Editor.UI\Editor.UI.csproj", "{14EADD4E-A06E-4E56-9D28-C616D33108EB}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Tests-NativeAOT", "src\Tests-NativeAOT\Tests-NativeAOT.csproj", "{7B9EE459-F2DD-4522-B488-D48AA6248C76}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Tests-NativeAOT", "src\Tests-NativeAOT~\Tests-NativeAOT.csproj", "{7B9EE459-F2DD-4522-B488-D48AA6248C76}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Friflo.Engine.ECS.Boost", "src\ECS.Boost\Friflo.Engine.ECS.Boost.csproj", "{542074FB-7752-44FC-9480-F2BE60DB3681}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Friflo.Engine.ECS.Boost", "src\ECS.Boost~\Friflo.Engine.ECS.Boost.csproj", "{542074FB-7752-44FC-9480-F2BE60DB3681}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CodeGen", "src\CodeGen\CodeGen.csproj", "{F1DF8513-7BE0-4449-9E0C-9E14409997B8}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CodeGen", "src\CodeGen~\CodeGen.csproj", "{F1DF8513-7BE0-4449-9E0C-9E14409997B8}"
 EndProject
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "src", "src", "{827E0CD3-B72D-47B6-A68D-7590B98EB39B}"
 EndProject
@@ -41,19 +41,19 @@ Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "ECS", "ECS", "{18BAFDEA-C15
 EndProject
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Server", "Server", "{79EF8E22-AB93-8587-636C-B128C98E6DF8}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Klotho.Server", "src\Klotho\Server\Klotho.Server.csproj", "{F250B699-5099-440E-8D9D-987C92575DFA}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Klotho.Server", "src\Klotho\Server~\Klotho.Server.csproj", "{F250B699-5099-440E-8D9D-987C92575DFA}"
 EndProject
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Tests", "Tests", "{AE629351-1CF5-BDD0-1A00-4F9D04680740}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Klotho.Tests", "src\Klotho\Tests\Klotho.Tests.csproj", "{93227AD3-089F-45B8-B55E-A23E1C055C55}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Klotho.Tests", "src\Klotho\Tests~\Klotho.Tests.csproj", "{93227AD3-089F-45B8-B55E-A23E1C055C55}"
 EndProject
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "AotSmoke", "AotSmoke", "{1642DA9D-F64B-5505-619E-BA8498C44820}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Klotho.AotSmoke", "src\Klotho\AotSmoke\Klotho.AotSmoke.csproj", "{F7199821-38C8-4665-B83C-EFD77B1BBC14}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Klotho.AotSmoke", "src\Klotho\AotSmoke~\Klotho.AotSmoke.csproj", "{F7199821-38C8-4665-B83C-EFD77B1BBC14}"
 EndProject
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "UdpMatch", "UdpMatch", "{BAAA6BBA-4D87-5903-BA0C-229C12A8300E}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Klotho.UdpMatch", "src\Klotho\UdpMatch\Klotho.UdpMatch.csproj", "{D97ADAB4-143B-47DF-AAD0-D981FE7ADADE}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Klotho.UdpMatch", "src\Klotho\UdpMatch~\Klotho.UdpMatch.csproj", "{D97ADAB4-143B-47DF-AAD0-D981FE7ADADE}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution

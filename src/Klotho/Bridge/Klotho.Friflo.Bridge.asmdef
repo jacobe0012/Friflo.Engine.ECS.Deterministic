@@ -1,0 +1,17 @@
+{
+    "name": "Klotho.Friflo.Bridge",
+    "rootNamespace": "Klotho.Friflo",
+    "references": [
+        "Friflo.Engine.ECS",
+        "Klotho.Runtime"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": true
+}
