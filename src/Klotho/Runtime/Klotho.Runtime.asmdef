@@ -1,7 +1,9 @@
 {
     "name": "Klotho.Runtime",
     "rootNamespace": "xpTURN.Klotho",
-    "references": [],
+    "references": [
+        "LiteNetLib"
+    ],
     "includePlatforms": [],
     "excludePlatforms": [],
     "allowUnsafeCode": true,

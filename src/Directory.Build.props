@@ -2,5 +2,19 @@
   <PropertyGroup>
     <!-- Renamed default output folders obj to .obj to avoid importing them by Unity -->
     <BaseIntermediateOutputPath>.obj\$(MSBuildProjectName)\</BaseIntermediateOutputPath>
-  </PropertyGroup>  
+
+    <!--
+      Same reason, for the output side. On the feat/unity-layout branch this tree lives under a
+      Unity project's Assets/, where Unity imports every .dll it finds as a managed plugin. A
+      plain `dotnet build` would drop Klotho.Runtime.dll / Friflo.Engine.ECS.dll into bin/, and
+      Unity then has both those DLLs and the assemblies it compiled from these same sources —
+      "An assembly with the same simple name has already been imported", plus a CS0433 for every
+      duplicated type.
+
+      Unity skips directories starting with '.', so .bin is invisible to it while `dotnet build`
+      keeps working unchanged. bin/ is already in .gitignore, which means this never shows up as
+      a dirty submodule — it just breaks the editor for whoever built last.
+    -->
+    <BaseOutputPath>.bin\$(MSBuildProjectName)\</BaseOutputPath>
+  </PropertyGroup>
 </Project>

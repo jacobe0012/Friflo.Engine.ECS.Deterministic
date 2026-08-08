@@ -42,12 +42,25 @@
   </ItemGroup>
 
   <ItemGroup>
-    <!-- The intermediate/output dirs live under this folder and hold generated .cs
-         (AssemblyInfo etc.), so they must be excluded or their attributes are compiled twice. -->
+    <!--
+      The intermediate/output dirs live under this folder and hold generated .cs
+      (AssemblyInfo etc.), so they must be excluded or their attributes are compiled twice.
+
+      Note ThirdParty\LiteNetLib.v2.1.4~ is deliberately NOT excluded. The `~` there is only for
+      Unity's benefit: a Unity project that consumes this repository is expected to supply
+      LiteNetLib as a UPM package (com.revenantx.litenetlib), and compiling this vendored copy as
+      well would give every LiteNetLib type two definitions — CS0433 at each use site. On the
+      .NET side there is no package to collide with, so the glob picks it up as before and the
+      server build is unaffected.
+
+      The two copies were verified byte-identical (25 files, plain 2.1.4 with no local changes),
+      so which one Unity compiles is not a behavioural choice.
+    -->
     <Compile Include="$(MSBuildThisFileDirectory)**\*.cs"
              Exclude="$(MSBuildThisFileDirectory)**\Json~\**\*.cs;
                       $(MSBuildThisFileDirectory)Plugins~\**\*.cs;
                       $(MSBuildThisFileDirectory).obj\**\*.cs;
+                      $(MSBuildThisFileDirectory).bin\**\*.cs;
                       $(MSBuildThisFileDirectory)bin\**\*.cs" />
   </ItemGroup>
 

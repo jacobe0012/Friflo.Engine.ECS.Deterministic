@@ -21,6 +21,25 @@ dedicated-server host, tooling — is suffixed:
 | `src/Klotho/Bridge/` | `src/Klotho/{Tests~,AotSmoke~,UdpMatch~,Server~,Tools~}/` |
 | `src/Klotho/Analyzers/` (source generator DLL) | `src/Klotho/Runtime/Plugins~/` (needs Microsoft.Extensions.Logging) |
 | | `src/Klotho/Runtime/ECS/DataAsset/Json~/` (Newtonsoft-coupled) |
+| | `src/Klotho/Runtime/ThirdParty/LiteNetLib.v2.1.4~` (see below) |
+
+### LiteNetLib comes from the consuming project
+
+`Klotho.Runtime` vendors LiteNetLib 2.1.4, and a Unity project that does any networking very
+likely already has `com.revenantx.litenetlib`. Compiling both puts every LiteNetLib type in two
+assemblies, and the errors land on *the game's* files rather than on either copy — a `CS0433`
+for `NetPeer` / `DisconnectInfo` / `INetEventListener` / `DeliveryMethod` at each use site.
+
+So the vendored copy is suffixed and `Klotho.Runtime.asmdef` references the `LiteNetLib` assembly
+instead. **The consuming project must supply `com.revenantx.litenetlib` 2.1.4.**
+
+This is safe rather than a judgement call: the two copies were diffed and are byte-identical
+across all 25 files — the vendored one is plain upstream 2.1.4 with no local changes. Only the
+packaging files (`asmdef` / `csproj` / `package.json`) differ, and those exist solely on the UPM
+side.
+
+The `.csproj` deliberately does *not* exclude the suffixed directory: on the .NET side there is
+no package to collide with, so the server build keeps compiling the vendored sources.
 
 `dotnet build Engine.sln` still builds all of it — `Engine.sln` and the `ProjectReference`
 paths were updated to match. The rename is invisible to the .NET side.
