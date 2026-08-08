@@ -285,14 +285,15 @@ public static class Test_Determinism
         var a2 = storeA.CreateEntity(new Pos { x = FP64.FromInt(3), y = FP64.FromInt(4) });
         var a3 = storeA.CreateEntity(new Pos { x = FP64.FromInt(5), y = FP64.FromInt(6) });
 
-        // Same ids and values, but the middle entity is (re)created last, so it occupies a
-        // different slot within the archetype.
+        // Same ids, revisions and values, but the middle entity leaves and re-enters this archetype,
+        // so it occupies a different slot. Component movement is used instead of delete/recreate:
+        // revision and recycle-stack differences are deterministic state and should change the hash.
         var storeB = new EntityStore();
         storeB.CreateEntity(new Pos { x = FP64.FromInt(1), y = FP64.FromInt(2) });
         var b2 = storeB.CreateEntity(new Pos { x = FP64.FromInt(9), y = FP64.FromInt(9) });
         storeB.CreateEntity(new Pos { x = FP64.FromInt(5), y = FP64.FromInt(6) });
-        b2.DeleteEntity();
-        storeB.CreateEntity(new Pos { x = FP64.FromInt(3), y = FP64.FromInt(4) });
+        b2.RemoveComponent<Pos>();
+        b2.AddComponent(new Pos { x = FP64.FromInt(3), y = FP64.FromInt(4) });
 
         var hashA = new FrifloSimulation(storeA, SampleSimulation.CreateSystems(storeA)).GetStateHash();
         var hashB = new FrifloSimulation(storeB, SampleSimulation.CreateSystems(storeB)).GetStateHash();

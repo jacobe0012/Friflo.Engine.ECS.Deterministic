@@ -236,12 +236,16 @@ public static class Test_NetworkedDeterminism
             // ticks, and if the rollback path — the whole reason for the delayed link — was taken.
             Assert.Greater(host.Simulation.CurrentTick, 0, "the match never advanced - the test proved nothing");
             Assert.Greater(comparisons, 0, "the peers never verified a common tick - nothing was compared");
-            Assert.Greater(host.Engine.Stats.TotalRollbacks, 0,
+            // Counted on the bridge, not on KlothoEngine.Stats: that property is compiled only
+            // under #if DEBUG, so reading it here made the entire test assembly fail to build in
+            // Release - the configuration a server ships in, and therefore the one whose test run
+            // matters most.
+            Assert.Greater(host.Simulation.RollbackCount, 0,
                 "the host never rolled back - prediction was never wrong, so re-simulation went untested");
-            Assert.Greater(guest.Engine.Stats.TotalRollbacks, 0,
+            Assert.Greater(guest.Simulation.RollbackCount, 0,
                 "the guest never rolled back - prediction was never wrong, so re-simulation went untested");
-            Assert.AreEqual(0, host.Engine.Stats.FailedRollbacks,  "host rollback failed");
-            Assert.AreEqual(0, guest.Engine.Stats.FailedRollbacks, "guest rollback failed");
+            Assert.AreEqual(0, host.FailedRollbackCount,  "host rollback failed");
+            Assert.AreEqual(0, guest.FailedRollbackCount, "guest rollback failed");
         }
         finally {
             guest.Stop();

@@ -85,6 +85,34 @@ public sealed class LoopbackHub
         client.RaisePeerConnected(ServerPeerId);
     }
 
+    /// <summary>
+    /// Create a client endpoint that takes over the peer id of one that has gone away.
+    /// </summary>
+    /// <param name="peerId">The id to reuse. Its previous endpoint must be disconnected.</param>
+    /// <remarks>
+    /// A real transport hands out peer ids from a bounded set and reissues them, so a peer id
+    /// outlives the connection it named — LiteNetLib reuses a freed slot for the next peer to
+    /// arrive. <see cref="CreateClient"/> deliberately never does this: every endpoint gets a fresh
+    /// id, which is the right default for a determinism harness because it keeps peers
+    /// distinguishable in a failure. But it also means a server that leaves stale per-peer state
+    /// behind is never confronted with it, because the id it kept is never asked for again. This is
+    /// how a test reaches that case on purpose.
+    /// </remarks>
+    public LoopbackTransport ReuseClient(int peerId)
+    {
+        var previous = Find(peerId);
+        if (previous == null) {
+            throw new ArgumentOutOfRangeException(nameof(peerId), peerId, "no endpoint has ever had that id");
+        }
+        if (previous.IsConnected) {
+            throw new InvalidOperationException(
+                $"peer {peerId} is still connected - a real transport only reissues an id once it is free");
+        }
+        var client       = new LoopbackTransport(this, peerId);
+        endpoints[peerId] = client;
+        return client;
+    }
+
     /// <summary>The endpoint with the passed id, or null if there is none.</summary>
     internal LoopbackTransport Find(int peerId) =>
         (uint)peerId < (uint)endpoints.Count ? endpoints[peerId] : null;

@@ -14,6 +14,7 @@
 //     component type `T`, which is only recoverable through the generic StructHeap<T>.
 
 using System;
+using System.Buffers.Binary;
 using System.Collections.Generic;
 using Friflo.Engine.ECS.Collections;
 using Friflo.Engine.ECS.Index;
@@ -98,6 +99,32 @@ namespace Friflo.Engine.ECS
             node.revision   = revision;
             node.isOwner    = isOwner;
             node.isLinked   = isLinked;
+        }
+
+        /// <summary>
+        /// Clear Friflo's optional structural-change recorder when it has already been created.
+        /// </summary>
+        /// <remarks>
+        /// A deterministic tick treats recorded component/tag changes as a per-tick stream. The
+        /// recorder itself is deliberately not created here: games that do not use EventFilter keep
+        /// Friflo's zero-allocation/no-subscription path.
+        /// </remarks>
+        internal void ClearRecordedEvents()
+        {
+            intern.eventRecorder?.ClearEvents();
+        }
+
+        /// <summary>Read the store-root identity without retaining its process-local store reference.</summary>
+        internal void GetStoreRootState(out int id, out short revision)
+        {
+            id       = storeRoot.Id;
+            revision = storeRoot.Revision;
+        }
+
+        /// <summary>Restore the public <see cref="StoreRoot"/> property from deterministic identity.</summary>
+        internal void SetStoreRootState(int id, short revision)
+        {
+            storeRoot = id <= 0 ? default : new Entity(this, id, revision);
         }
         #endregion
 
@@ -546,6 +573,36 @@ namespace Friflo.Engine.ECS
         /// The component type contains references. Such a component cannot participate in a
         /// deterministic simulation: its bytes are addresses that differ per run and per peer.
         /// </exception>
+        /// <remarks>
+        /// The bytes are consumed eight at a time rather than one at a time. The server hashes
+        /// every tick it executes, so this runs once per component per tick and was measured at
+        /// roughly four fifths of a server tick's total cost — the hash took longer than the
+        /// simulation it was hashing, and grew linearly with component width at about a nanosecond
+        /// per byte. Mixing whole words cuts the per-component loop by the width of a word.
+        /// <para>
+        /// The component is copied to a local first, which is what confines the read to this one
+        /// value: components of a type live back to back in a single array, so reading through to
+        /// the element would let a word-sized read at the tail take bytes from the next component.
+        /// The copy also gives the tail its zero fill, so a partial final word is well defined
+        /// without a separate byte path — meaning tail bytes and body bytes are mixed by the same
+        /// arithmetic, and cannot disagree.
+        /// </para>
+        /// <para>
+        /// <b>Words are read little-endian regardless of the machine.</b> The byte loop this
+        /// replaces was endian-agnostic for free — it consumed bytes in address order, which is the
+        /// same sequence everywhere. Reinterpreting memory as words is not: the same bytes give
+        /// different words on a big-endian machine, so peers of differing endianness would compute
+        /// different hashes for identical state and each report the other as desynced. Reading
+        /// through <see cref="BinaryPrimitives"/> fixes the byte order at little-endian, which is
+        /// also what Klotho's own wire serialization does (see <c>SpanWriter</c>). On the
+        /// little-endian machines this actually runs on, the call is a plain load.
+        /// </para>
+        /// <para>
+        /// This changes the hash values themselves, which is safe because they are only ever
+        /// compared between peers running the same build (Klotho pairs them with a static
+        /// fingerprint) and never persisted. It is not a wire format.
+        /// </para>
+        /// </remarks>
         internal override ulong HashComponent(int compIndex)
         {
             if (DeterministicLayout<T>.HasReferences) {
@@ -553,14 +610,27 @@ namespace Friflo.Engine.ECS
                 // process-local store reference. See DeterministicComponentLayout.cs.
                 return DeterministicLayout<T>.Hash(components[compIndex]);
             }
+            // Local copy: bounds the read to this component, and zero-fills the final partial word.
             var value = components[compIndex];
             var bytes = System.Runtime.InteropServices.MemoryMarshal.AsBytes(
                 System.Runtime.InteropServices.MemoryMarshal.CreateReadOnlySpan(ref value, 1));
 
-            ulong hash = 14695981039346656037;
-            foreach (var b in bytes) {
-                hash ^= b;
-                hash *= 1099511628211;
+            const ulong prime = 1099511628211;
+            ulong       hash  = 14695981039346656037;
+            int         whole = bytes.Length - (bytes.Length % sizeof(ulong));
+            for (int i = 0; i < whole; i += sizeof(ulong)) {
+                hash ^= BinaryPrimitives.ReadUInt64LittleEndian(bytes.Slice(i, sizeof(ulong)));
+                hash *= prime;
+            }
+            // Bytes past the last whole word, assembled in the same little-endian order so a value
+            // hashes identically whether its trailing bytes fall in a whole word or in the tail.
+            if (whole < bytes.Length) {
+                ulong tail = 0;
+                for (int i = whole; i < bytes.Length; i++) {
+                    tail |= (ulong)bytes[i] << (8 * (i - whole));
+                }
+                hash ^= tail;
+                hash *= prime;
             }
             return hash;
         }

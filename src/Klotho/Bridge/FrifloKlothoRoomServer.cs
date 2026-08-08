@@ -64,7 +64,18 @@ public sealed class FrifloKlothoRoomServer : IDisposable
     public int MaxRooms => rooms.Length;
 
     /// <summary>Rooms currently hosting a match.</summary>
+    /// <remarks>
+    /// Counts rooms that still occupy a slot, which is what capacity is about — a room stays
+    /// counted while it drains and stops being counted when its slot is free again.
+    /// </remarks>
     public int ActiveRoomCount { get; private set; }
+
+    /// <summary>Matches this server has hosted to completion, over its whole life.</summary>
+    /// <remarks>
+    /// Exists so slot reuse is observable. Without it, a server whose rooms end and reopen looks
+    /// exactly like one that never ends a room at all.
+    /// </remarks>
+    public int CompletedRoomCount { get; private set; }
 
     /// <summary>
     /// How a room is built: its configuration, its systems, and its world.
@@ -268,19 +279,85 @@ public sealed class FrifloKlothoRoomServer : IDisposable
     /// </summary>
     /// <param name="deltaTime">Elapsed wall-clock seconds since the previous call.</param>
     /// <remarks>
-    /// The two stages are separate for the reason <c>ServerLoop</c> separates them: the socket is
+    /// The stages are separate for the reason <c>ServerLoop</c> separates them: the socket is
     /// shared, so one poll fans out to every room's inbound queue, and a room drains its own queue
     /// when it updates. Polling per room would have each room consuming packets addressed to the
     /// others.
+    /// <para>
+    /// Reclaiming finished rooms runs <i>before</i> the poll, matching <c>ServerLoop</c>'s stage 0.
+    /// The ordering matters in one direction: a room released after this frame's packets were
+    /// already fanned out would leave those packets queued on a room nobody updates again, so the
+    /// releases happen while the queues are empty.
+    /// </para>
     /// </remarks>
     public void Update(float deltaTime)
     {
         if (stopped) {
             return;
         }
+        ReclaimFinishedRooms();
         transport.PollEvents();
+        router.CleanupUnroutedPeers();
         UpdateRooms(deltaTime);
         transport.FlushSendQueue();
+    }
+
+    /// <summary>
+    /// Move rooms whose match has ended through to release, freeing their slots.
+    /// </summary>
+    /// <remarks>
+    /// <c>Room.Update</c> promotes a room to <see cref="RoomState.Draining"/> on its own once its
+    /// peers are gone or its end grace expires, but nothing in Klotho then acts on that for a
+    /// server built this way: the two stages that finish the job live on <c>RoomManager</c>
+    /// (<c>TransitionDrainingRooms</c> and <c>CleanupDisposingRooms</c>), which this server
+    /// replaces. Without them a drained room is simply never visited again — it is skipped by an
+    /// update loop that only walks <see cref="RoomState.Active"/> rooms, while its slot, store,
+    /// engine and network service stay held for the life of the process. Nothing fails; the
+    /// server just quietly hosts fewer matches the longer it runs.
+    /// <para>
+    /// The two states stay distinct rather than collapsing into one step, because they are separate
+    /// moments: <see cref="RoomState.Draining"/> stops the engine, and only the frame after does
+    /// the room release its peers and its slot. Merging them would tear down the room inside the
+    /// same frame its last packets are still being answered.
+    /// </para>
+    /// </remarks>
+    private void ReclaimFinishedRooms()
+    {
+        for (int i = 0; i < rooms.Length; i++) {
+            var room = rooms[i];
+            if (room == null) {
+                continue;
+            }
+            if (room.State == RoomState.Draining) {
+                // Stop the engine first: it must not tick again once the room is being taken down.
+                room.Engine.Stop();
+                room.State = RoomState.Disposing;
+                continue;
+            }
+            if (room.State == RoomState.Disposing) {
+                ReleaseRoom(i, room);
+            }
+        }
+    }
+
+    /// <summary>Release a room's slot and everything the room holds.</summary>
+    /// <remarks>
+    /// The peer mappings are cleared through <c>RemoveRoomPeers</c> as well as the room
+    /// registration. They are two different tables: unregistering the room stops packets being
+    /// routed to it, while the peer entries are keyed by peer and would otherwise survive every
+    /// later room release, since no room they name exists any more to clear them.
+    /// </remarks>
+    private void ReleaseRoom(int roomId, Room room)
+    {
+        router.UnregisterRoom(roomId);
+        router.RemoveRoomPeers(roomId);
+        room.Dispose();
+
+        rooms[roomId]       = null;
+        simulations[roomId] = null;
+        ActiveRoomCount--;
+        CompletedRoomCount++;
+        logger?.KInformation($"[FrifloKlothoRoomServer] room {roomId} released (active={ActiveRoomCount})");
     }
 
     /// <summary>
@@ -289,13 +366,19 @@ public sealed class FrifloKlothoRoomServer : IDisposable
     /// <remarks>
     /// Sequential, and the override point if that is ever to change — see the note on the class for
     /// why it is not the thread-pool dispatch <c>ServerLoop</c> uses.
+    /// <para>
+    /// Draining rooms are updated too, as <c>ServerLoop.GetReadyRooms</c> does. A draining room
+    /// still has an inbound queue to consume and departures to answer, and skipping it would also
+    /// leave the buffers in that queue unreturned.
+    /// </para>
     /// </remarks>
     private void UpdateRooms(float deltaTime)
     {
         readyRooms.Clear();
         for (int i = 0; i < rooms.Length; i++) {
-            if (rooms[i] != null && rooms[i].State == RoomState.Active) {
-                readyRooms.Add(rooms[i]);
+            var room = rooms[i];
+            if (room != null && (room.State == RoomState.Active || room.State == RoomState.Draining)) {
+                readyRooms.Add(room);
             }
         }
         for (int i = 0; i < readyRooms.Count; i++) {
@@ -311,13 +394,14 @@ public sealed class FrifloKlothoRoomServer : IDisposable
         }
         stopped = true;
         for (int i = 0; i < rooms.Length; i++) {
-            if (rooms[i] == null) {
+            var room = rooms[i];
+            if (room == null) {
                 continue;
             }
-            router.UnregisterRoom(i);
-            rooms[i].Engine.Stop();
-            rooms[i].NetworkService.LeaveRoom();
-            rooms[i] = null;
+            room.Engine.Stop();
+            // Through the same release path as a room that ended on its own, so shutdown cannot
+            // drift from the per-room teardown and forget one of the tables.
+            ReleaseRoom(i, room);
         }
         ActiveRoomCount = 0;
         router.Dispose();

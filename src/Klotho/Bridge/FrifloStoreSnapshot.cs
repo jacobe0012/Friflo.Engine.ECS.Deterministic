@@ -55,6 +55,9 @@ internal sealed class FrifloStoreSnapshot
     private int[]       recycleIds = new int[8];
     private int         recycleCount;
     private int         entityCount;
+    private bool        recycleIdsEnabled;
+    private int         storeRootId;
+    private short       storeRootRevision;
 
     /// <summary>Scratch list of relation archetypes; reused so capture stays allocation-free.</summary>
     private readonly List<Archetype> relationArchetypes = new();
@@ -270,6 +273,8 @@ internal sealed class FrifloStoreSnapshot
         sequenceId   = store.SequenceId;
         recycleCount = store.GetRecycleIds(ref recycleIds);
         entityCount  = store.Count;
+        recycleIdsEnabled = store.RecycleIds;
+        store.GetStoreRootState(out storeRootId, out storeRootRevision);
     }
 
     // ------------------------------------------------------------------ restore
@@ -285,6 +290,9 @@ internal sealed class FrifloStoreSnapshot
         RestoreHierarchy();
         RestoreScripts();
         RebuildLookupTables();
+        // Events describe operations, not the restored state. Anything recorded since this
+        // snapshot belongs to the abandoned branch and must not remain observable after Rollback.
+        store.ClearRecordedEvents();
     }
 
     /// <summary>Restore the parent map and rebuild every child list from the captured ids.</summary>
@@ -371,8 +379,10 @@ internal sealed class FrifloStoreSnapshot
             store.SetNodeState(id, null, 0, 0, 0, 0);
         }
         store.SequenceId          = sequenceId;
+        store.RecycleIds          = recycleIdsEnabled;
         store.SetRecycleIds(recycleIds, recycleCount);
         store.EntityCountInternal = entityCount;
+        store.SetStoreRootState(storeRootId, storeRootRevision);
     }
 
     /// <summary>

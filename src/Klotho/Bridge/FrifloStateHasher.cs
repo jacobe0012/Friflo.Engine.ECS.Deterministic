@@ -24,6 +24,8 @@ internal sealed class FrifloStateHasher
 {
     private readonly EntityStore     store;
     private readonly List<Archetype> relationArchetypes = new();
+    /// <summary>Scratch for the LIFO id allocator state. Reused so steady-state hashing allocates nothing.</summary>
+    private int[]                    recycleIds = new int[8];
 
     internal FrifloStateHasher(EntityStore store)
     {
@@ -48,7 +50,59 @@ internal sealed class FrifloStateHasher
             total += HashArchetype(archetype);
         }
         total += HashScripts();
+        total += HashStoreMetadata();
         return unchecked((long)total);
+    }
+
+    /// <summary>
+    /// Hash store metadata that controls future simulation behaviour but is not represented by a
+    /// live component: entity revisions, the sequence allocator and its ordered recycle stack.
+    /// </summary>
+    /// <remarks>
+    /// Two stores can have byte-identical live entities while their recycle stacks have a different
+    /// order. The very next <c>CreateEntity()</c> then returns different ids. Likewise, revision is
+    /// part of <see cref="Entity"/> identity and changes stale-handle behaviour. Leaving either out
+    /// turns a current hash match into a false assurance about the next tick.
+    /// <para>
+    /// Parent ids and relation ownership/link bits are included too. They are lookup-side state
+    /// used directly by Friflo APIs and are serialized in FullState; hashing them prevents a broken
+    /// derived table from hiding behind otherwise-correct component bytes. Archetype/slot indices
+    /// are deliberately excluded because they are storage layout, not logical state.
+    /// </para>
+    /// </remarks>
+    private ulong HashStoreMetadata()
+    {
+        ulong hash = FnvOffset;
+        // Domain separator: prevents this stream being confused with a component byte stream when
+        // its result is folded into the commutative total.
+        Mix(ref hash, 0x465249464C4F4D45UL); // "FRIFLOME"
+
+        int sequenceId = store.SequenceId;
+        Mix(ref hash, (ulong)(uint)sequenceId);
+        Mix(ref hash, (ulong)(uint)store.Count);
+        Mix(ref hash, store.RecycleIds ? 1UL : 0UL);
+        store.GetStoreRootState(out int storeRootId, out short storeRootRevision);
+        Mix(ref hash, (ulong)(uint)storeRootId);
+        Mix(ref hash, (ulong)(ushort)storeRootRevision);
+
+        int recycleCount = store.GetRecycleIds(ref recycleIds);
+        Mix(ref hash, (ulong)(uint)recycleCount);
+        for (int i = 0; i < recycleCount; i++) {
+            // Order is meaningful: NewId pops this stack LIFO.
+            Mix(ref hash, (ulong)(uint)recycleIds[i]);
+        }
+
+        var parentMap = store.GetParentMap();
+        for (int id = 1; id <= sequenceId; id++) {
+            var live = store.GetEntityNode(id).Archetype != null;
+            store.GetNodeState(id, out _, out short revision, out int isOwner, out int isLinked);
+            Mix(ref hash, live ? 1UL : 0UL);
+            Mix(ref hash, (ulong)(ushort)revision);
+            Mix(ref hash, (ulong)(uint)isOwner);
+            Mix(ref hash, (ulong)(uint)isLinked);
+            Mix(ref hash, (ulong)(uint)(id < parentMap.Length ? parentMap[id] : 0));
+        }
+        return hash;
     }
 
     /// <summary>

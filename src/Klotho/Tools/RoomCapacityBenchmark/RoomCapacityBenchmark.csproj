@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <AssemblyName>Klotho.RoomCapacityBenchmark</AssemblyName>
+    <RootNamespace>Klotho.Friflo.Capacity</RootNamespace>
+    <IsPackable>false</IsPackable>
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\Bridge\Klotho.Friflo.Bridge.csproj" />
+    <ProjectReference Include="..\..\Runtime\Klotho.Runtime.csproj" />
+    <ProjectReference Include="..\..\..\ECS\Friflo.Engine.ECS.csproj" />
+  </ItemGroup>
+
+</Project>

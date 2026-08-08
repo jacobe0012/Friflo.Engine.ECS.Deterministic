@@ -34,9 +34,11 @@ internal sealed class FrifloStateSerializer
     /// Version 2 added the hierarchy and script sections: a peer reading version 1 would silently
     /// build a world with no scripts and a broken child pool. Version 3 widened the archetype tag
     /// field from one 64-bit word to all four, so a peer mixing the two would misread every
-    /// archetype header from that field onwards.
+    /// archetype header from that field onwards. Version 4 added RecycleIds and StoreRoot: both are
+    /// public EntityStore state that changes future allocation/tree behaviour despite living outside
+    /// archetype component data.
     /// </summary>
-    private const int FormatVersion = 3;
+    private const int FormatVersion = 4;
 
     private readonly EntityStore store;
 
@@ -58,6 +60,10 @@ internal sealed class FrifloStateSerializer
         writer.Write(store.SequenceId);
         writer.Write(store.Count);
         writer.Write(store.Capacity);
+        writer.Write(store.RecycleIds);
+        store.GetStoreRootState(out int storeRootId, out short storeRootRevision);
+        writer.Write(storeRootId);
+        writer.Write(storeRootRevision);
 
         WriteRecycleIds(writer);
         WriteArchetypes(writer);
@@ -230,6 +236,9 @@ internal sealed class FrifloStateSerializer
         int sequenceId  = reader.ReadInt32();
         int entityCount = reader.ReadInt32();
         int capacity    = reader.ReadInt32();
+        bool recycleIdsEnabled = reader.ReadBoolean();
+        int storeRootId        = reader.ReadInt32();
+        short storeRootRevision = reader.ReadInt16();
 
         var recycleIds   = ReadRecycleIds(reader, out int recycleCount);
         var archetypes   = ReadArchetypes(reader);
@@ -239,8 +248,10 @@ internal sealed class FrifloStateSerializer
         ReadNodes(reader, capacity, archetypes);
 
         store.SequenceId          = sequenceId;
+        store.RecycleIds          = recycleIdsEnabled;
         store.SetRecycleIds(recycleIds, recycleCount);
         store.EntityCountInternal = entityCount;
+        store.SetStoreRootState(storeRootId, storeRootRevision);
 
         // After ReadNodes: rebuilding the child pool walks the nodes to find each TreeNode, and
         // attaching a script needs the owning entity's restored revision.
@@ -248,6 +259,9 @@ internal sealed class FrifloStateSerializer
         ReadScripts(reader);
 
         store.RebuildIndexesAndRelations();
+        // A FullState replaces the local timeline. Recorded structural changes from that discarded
+        // timeline are not part of the authoritative state and must not survive the replacement.
+        store.ClearRecordedEvents();
         return currentTick;
     }
 

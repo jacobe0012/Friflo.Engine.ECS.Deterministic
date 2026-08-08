@@ -179,15 +179,20 @@ public static class Test_HierarchyRollback
     {
         var storeA = BuildTree(out _);
 
-        // Same final tree, but reached after churning the pool with add/remove cycles.
+        // Same final tree and the same entity allocator/revision history, but only B churns the
+        // child-list pool. Allocating/deleting matching entities in A prevents this test from
+        // accidentally comparing different recycle stacks instead of different pool offsets.
         var storeB = BuildTree(out var parentB);
-        var churn  = new List<Entity>();
+        var churnA = new List<Entity>();
+        var churnB = new List<Entity>();
         for (int i = 0; i < 5; i++) {
-            churn.Add(storeB.CreateEntity(new Pos { x = FP64.One, y = FP64.One }));
+            churnA.Add(storeA.CreateEntity(new Pos { x = FP64.One, y = FP64.One }));
+            churnB.Add(storeB.CreateEntity(new Pos { x = FP64.One, y = FP64.One }));
         }
-        foreach (var entity in churn) parentB.AddChild(entity);
-        foreach (var entity in churn) parentB.RemoveChild(entity);
-        foreach (var entity in churn) entity.DeleteEntity();
+        foreach (var entity in churnB) parentB.AddChild(entity);
+        foreach (var entity in churnB) parentB.RemoveChild(entity);
+        foreach (var entity in churnA) entity.DeleteEntity();
+        foreach (var entity in churnB) entity.DeleteEntity();
 
         var hashA = new FrifloSimulation(storeA, SampleSimulation.CreateSystems(storeA)).GetStateHash();
         var hashB = new FrifloSimulation(storeB, SampleSimulation.CreateSystems(storeB)).GetStateHash();

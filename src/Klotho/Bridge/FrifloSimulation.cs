@@ -115,6 +115,11 @@ public sealed class FrifloSimulation : ISimulation
     /// </remarks>
     public void Tick(List<ICommand> commands)
     {
+        // Friflo documents EventRecorder as a frame-local stream normally cleared at the start of
+        // a frame. Doing it here makes that boundary deterministic during rollback re-simulation:
+        // events emitted by the abandoned branch cannot leak into the corrected tick, while command
+        // events below remain visible to every system executed in this tick.
+        store.ClearRecordedEvents();
         applyCommands?.Invoke(store, commands, CurrentTick);
         systems.Update(default);
         CurrentTick++;

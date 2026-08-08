@@ -70,6 +70,17 @@ public sealed class FrifloKlothoSession : IDisposable
     /// <summary>True once every player in the room has readied up.</summary>
     public bool AllPlayersReady => networkService.AllPlayersReady;
 
+    /// <summary>How many rollback requests the engine could not serve.</summary>
+    /// <remarks>
+    /// Counted here rather than read off <c>KlothoEngine.Stats</c>, which is compiled only under
+    /// <c>#if DEBUG</c> — reaching for it puts the whole assembly out of reach of a Release build,
+    /// which is the configuration a server actually ships. The engine raises
+    /// <c>OnRollbackFailed</c> in every configuration, so the same fact is available without the
+    /// dependency. <see cref="FrifloSimulation.RollbackCount"/> is the companion for the
+    /// succeeded case, and exists for the same reason.
+    /// </remarks>
+    public int FailedRollbackCount { get; private set; }
+
     /// <summary>Routes <see cref="IFrifloCommandSink"/> sends to the engine's input path.</summary>
     private sealed class CommandSink : IFrifloCommandSink
     {
@@ -208,8 +219,12 @@ public sealed class FrifloKlothoSession : IDisposable
         engine.Initialize(simulation, networkService, logger);
         engine.SetCommandFactory(commandFactory);
         engine.OnPreTick += HandlePreTick;
+        engine.OnRollbackFailed += HandleRollbackFailed;
         networkService.SubscribeEngine(engine);
     }
+
+    /// <summary>Note a rollback the engine could not serve. See <see cref="FailedRollbackCount"/>.</summary>
+    private void HandleRollbackFailed(int targetTick, string reason) => FailedRollbackCount++;
 
     /// <summary>
     /// Seed the world once the roster and the shared random seed are settled.
@@ -268,6 +283,7 @@ public sealed class FrifloKlothoSession : IDisposable
         }
         stopped = true;
         engine.OnPreTick           -= HandlePreTick;
+        engine.OnRollbackFailed    -= HandleRollbackFailed;
         networkService.OnGameStart -= HandleGameStart;
         engine.Stop();
         networkService.LeaveRoom(keepReconnectCredentials);
