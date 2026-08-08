@@ -62,8 +62,12 @@ Neither assembly bundles its NuGet dependencies. Install via NuGetForUnity (or e
 
 | Assembly | Needs |
 |---|---|
-| `Friflo.Engine.ECS` | `Friflo.Json.Fliox`, `Friflo.Json.Burst`, `System.Runtime.CompilerServices.Unsafe` |
+| `Friflo.Engine.ECS` | `Friflo.Json.Fliox` 1.0.4, `Friflo.Json.Fliox.Annotation` 1.0.4, `Friflo.Json.Burst` 1.0.4, `System.ComponentModel.Annotations` 5.0.0 |
 | `Klotho.Runtime` | `Newtonsoft.Json` (`com.unity.nuget.newtonsoft-json` works) |
+
+`System.ComponentModel.Annotations` is easy to miss: `DataEntity.pid` carries `[Key]`, which comes
+from there rather than from Fliox, and Unity's netstandard2.1 profile does not include that
+assembly. Friflo's own `src/Tests-Unity~` project lists the same package for the same reason.
 
 ## Language version
 
