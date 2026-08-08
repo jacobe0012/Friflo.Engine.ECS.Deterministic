@@ -205,7 +205,7 @@ public sealed class MemberPath
         foreach (var field in fields) {
             fieldExpr = PropertyOrField(fieldExpr, field);
         }
-        return Expression.Lambda<MemberPathGetter<TComponent, TField>>(fieldExpr, name, [arg]).Compile();
+        return Expression.Lambda<MemberPathGetter<TComponent, TField>>(fieldExpr, name, new [] { arg }).Compile();
     }
     
     [UnconditionalSuppressMessage("ReflectionAnalysis", "IL2026", Justification = "Not called for NativeAOT")]
@@ -218,7 +218,7 @@ public sealed class MemberPath
             fieldExpr = PropertyOrField(fieldExpr, field);
         }
         var assign = Expression.Assign(fieldExpr, value);
-        return Expression.Lambda<MemberPathSetter<TComponent, TField>>(assign, name, [arg, value]).Compile();
+        return Expression.Lambda<MemberPathSetter<TComponent, TField>>(assign, name, new [] { arg, value }).Compile();
     }
     
     /// <summary>

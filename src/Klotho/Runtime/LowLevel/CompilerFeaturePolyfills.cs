@@ -24,6 +24,23 @@ namespace System.Runtime.CompilerServices
     }
 
     /// <summary>
+    /// Marks a method to run automatically when the assembly loads.
+    /// </summary>
+    /// <remarks>
+    /// KlothoGenerator emits these on the registration methods it generates, so this polyfill is
+    /// what makes the generated code compile at all under Unity — the command / message / component
+    /// type registrations happen in module initializers.
+    /// <para>
+    /// It must be <c>public</c>, unlike the two handler attributes: the generated code lives in the
+    /// same assembly today, but the attribute is part of the contract the generator emits against.
+    /// </para>
+    /// </remarks>
+    [AttributeUsage(AttributeTargets.Method, Inherited = false)]
+    public sealed class ModuleInitializerAttribute : Attribute
+    {
+    }
+
+    /// <summary>
     /// Names the parameters to pass to the handler's constructor, ahead of literalLength and
     /// formattedCount.
     /// </summary>
