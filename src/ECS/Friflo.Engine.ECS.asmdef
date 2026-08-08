@@ -9,8 +9,7 @@
     "precompiledReferences": [
         "Friflo.Json.Fliox.dll",
         "Friflo.Json.Fliox.Annotation.dll",
-        "Friflo.Json.Burst.dll",
-        "System.ComponentModel.Annotations.dll"
+        "Friflo.Json.Burst.dll"
     ],
     "autoReferenced": true,
     "defineConstraints": [],

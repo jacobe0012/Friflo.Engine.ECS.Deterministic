@@ -3,7 +3,9 @@
 
 using System;
 using System.Collections.Generic;
-using System.ComponentModel.DataAnnotations;
+#if !UNITY_2018_1_OR_NEWER
+using System.ComponentModel.DataAnnotations;    // [Key] — see DataEntity.pid
+#endif
 using Friflo.Json.Fliox;
 
 // ReSharper disable ClassNeverInstantiated.Global
@@ -25,8 +27,19 @@ namespace Friflo.Engine.ECS.Serialize;
 public sealed class DataEntity
 {
     /// <summary>Permanent id used to identify entities in a database</summary>
+    /// <remarks>
+    /// [Key] marks this as the primary key for a Fliox database (EntityStore itself never reads
+    /// it). It comes from System.ComponentModel.DataAnnotations, which is absent from the
+    /// netstandard2.1 profile Unity compiles against — Unity resolves the name to its own
+    /// System.ComponentModel.Annotations facade, which forwards to mscorlib and does not carry
+    /// KeyAttribute, so shipping the real NuGet package alongside does not win. Omitted under
+    /// Unity: nothing there hosts a Fliox database, and [Serialize("id")] — which does affect the
+    /// wire format — is unconditional.
+    /// </remarks>
+#if !UNITY_2018_1_OR_NEWER
     [Key]
-    [Serialize            ("id")] 
+#endif
+    [Serialize            ("id")]
     public  long            pid;        //  8
     
     /// <summary>
