@@ -16,9 +16,9 @@ public interface ICommandBuffer
     
 #region component
     public ref T AddComponent   <T>(int entityId)                   where T : struct, IComponent;
-    public ref T AddComponent   <T>(int entityId, in T component)   where T : struct, IComponent;
+    public ref T AddComponent   <T>(int entityId, scoped in T component)   where T : struct, IComponent;
     [Obsolete("use AddComponent() instead")]
-    public ref T SetComponent   <T>(int entityId, in T component)   where T : struct, IComponent;
+    public ref T SetComponent   <T>(int entityId, scoped in T component)   where T : struct, IComponent;
     public void  RemoveComponent<T>(int entityId)                   where T : struct, IComponent;
     #endregion
     
