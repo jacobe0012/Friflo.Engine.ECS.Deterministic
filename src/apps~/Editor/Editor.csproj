@@ -7,7 +7,7 @@
         <Nullable>disable</Nullable>
         <GenerateProgramFile>true</GenerateProgramFile>
         <RootNamespace>Friflo.Editor</RootNamespace>
-        
+
         <!-- Avalionia specific -->
         <BuiltInComInteropSupport>true</BuiltInComInteropSupport>
         <ApplicationManifest>app.manifest</ApplicationManifest>
@@ -51,8 +51,8 @@
 
     <ItemGroup>
 
-        <PackageReference Include="Avalonia.Desktop" Version="11.2.2" />
-        <PackageReference Include="Avalonia.Fonts.Inter" Version="11.2.2" />
+        <PackageReference Include="Avalonia.Desktop" Version="11.3.22" />
+        <PackageReference Include="Avalonia.Fonts.Inter" Version="11.3.22" />
         <!--<PackageReference Include="Silk.NET.Windowing" Version="2.20.0" />-->
 
         <!--Condition below is needed to remove Avalonia.Diagnostics package from build output in Release configuration.-->
@@ -71,7 +71,7 @@
     </ItemGroup>
 
     <ItemGroup>
-    
+
       <Compile Update="UI\MainWindow.axaml.cs">
         <DependentUpon>MainWindow.axaml</DependentUpon>
         <SubType>Code</SubType>
