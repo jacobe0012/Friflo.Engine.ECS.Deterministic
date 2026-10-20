@@ -5,6 +5,12 @@
 > 结论状态：**有条件通过（Conditional Pass）**  
 > 容量口径：**单进程** `FrifloKlothoRoomServer`，不是整台机器跨进程总量
 
+> **2026-10-19 更正**：本报告记录的是先前审计结果，不是当前分支的最终验证。
+> 后续发现并修复了 NativeAOT 字段裁剪、Script 私有基类状态、Entity 默认值/revision/readonly
+> 边界及 late-join roster、SD 权威配置采用问题。当前 FullState 为 **v5**；NativeAOT 嵌套值类型
+> 采用显式 `RegisterDeterministicType<T>()`，遗漏即报错。当前合同见
+> [UNITY-LAYOUT.md](../UNITY-LAYOUT.md#deterministic-state-and-nativeaot-registration)。
+
 ## 1. 执行摘要
 
 当前移植可以让 Friflo ECS 的确定性子集运行在 Klotho 的 P2P 预测回滚、Server-Driven

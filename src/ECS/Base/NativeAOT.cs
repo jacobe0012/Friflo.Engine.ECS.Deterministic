@@ -18,6 +18,7 @@ public sealed class NativeAOT
     private             EntitySchema                entitySchema;
     private             bool                        engineTypesRegistered;
         
+    private readonly    HashSet<Type>               deterministicTypes = new();
     private readonly    HashSet<Type>               typeSet     = new();
     private readonly    SchemaTypes                 schemaTypes = new();
     private readonly    Dictionary<Assembly, int>   assemblyMap = new();
@@ -119,9 +120,31 @@ A type initializer threw an exception. To determine which type, inspect the Inne
             assemblies.Add(assembly);
         }
         schemaTypes.AddSchemaType(new AssemblyType(type, kind, assemblyIndex));
+        if (kind != SchemaTypeKind.Tag) {
+            deterministicTypes.Add(type);
+        }
     }
+
+    /// <summary>Preserve the fields of a nested value type used by the deterministic rollback bridge.</summary>
+    /// <remarks>
+    /// Call before <see cref="CreateSchema"/> for each non-primitive value type reached through
+    /// component or script fields. Registering the outer type does not preserve its field types'
+    /// members. This registers metadata only: it does not add a component to the entity schema.
+    /// </remarks>
+    public void RegisterDeterministicType<[DynamicallyAccessedMembers(
+            DynamicallyAccessedMemberTypes.PublicFields |
+            DynamicallyAccessedMemberTypes.NonPublicFields)] T>() where T : struct
+    {
+        InitSchema();
+        deterministicTypes.Add(typeof(T));
+    }
+
+    internal static bool IsDeterministicTypeRegistered(Type type)
+        => Instance?.deterministicTypes.Contains(type) == true;
     
-    public void RegisterComponent<T>() where T : struct, IComponent 
+    public void RegisterComponent<[DynamicallyAccessedMembers(
+            DynamicallyAccessedMemberTypes.PublicFields |
+            DynamicallyAccessedMemberTypes.NonPublicFields)] T>() where T : struct, IComponent
     {
         InitSchema();
         if (typeSet.Add(typeof(T))) {
@@ -130,7 +153,9 @@ A type initializer threw an exception. To determine which type, inspect the Inne
         }
     }
     
-    public void RegisterIndexedComponentClass<T, TValue>()
+    public void RegisterIndexedComponentClass<[DynamicallyAccessedMembers(
+            DynamicallyAccessedMemberTypes.PublicFields |
+            DynamicallyAccessedMemberTypes.NonPublicFields)] T, TValue>()
         where T : struct, IIndexedComponent<TValue>
         where TValue : class
     {
@@ -146,7 +171,9 @@ A type initializer threw an exception. To determine which type, inspect the Inne
         }
     }
     
-    public void RegisterIndexedComponentStruct<T, TValue>()
+    public void RegisterIndexedComponentStruct<[DynamicallyAccessedMembers(
+            DynamicallyAccessedMemberTypes.PublicFields |
+            DynamicallyAccessedMemberTypes.NonPublicFields)] T, TValue>()
         where T : struct, IIndexedComponent<TValue>
         where TValue : struct
     {
@@ -162,7 +189,9 @@ A type initializer threw an exception. To determine which type, inspect the Inne
         }
     }
     
-    public void RegisterIndexedComponentEntity<T>()
+    public void RegisterIndexedComponentEntity<[DynamicallyAccessedMembers(
+            DynamicallyAccessedMemberTypes.PublicFields |
+            DynamicallyAccessedMemberTypes.NonPublicFields)] T>()
         where T : struct, ILinkComponent
     {
         InitSchema();
@@ -177,7 +206,9 @@ A type initializer threw an exception. To determine which type, inspect the Inne
         }
     }
     
-    public void RegisterRelation<T, TKey>()
+    public void RegisterRelation<[DynamicallyAccessedMembers(
+            DynamicallyAccessedMemberTypes.PublicFields |
+            DynamicallyAccessedMemberTypes.NonPublicFields)] T, TKey>()
         where T : struct, IRelation<TKey>
     {
         InitSchema();
@@ -192,7 +223,9 @@ A type initializer threw an exception. To determine which type, inspect the Inne
         }
     }
     
-    public void RegisterLinkRelation<T>()
+    public void RegisterLinkRelation<[DynamicallyAccessedMembers(
+            DynamicallyAccessedMemberTypes.PublicFields |
+            DynamicallyAccessedMemberTypes.NonPublicFields)] T>()
         where T : struct, ILinkRelation
     {
         InitSchema();
@@ -216,15 +249,10 @@ A type initializer threw an exception. To determine which type, inspect the Inne
         }
     }
     
-    // The field annotation keeps ILC from trimming T's field reflection metadata. The deterministic
-    // rollback bridge reads a script's fields through its runtime type (DeterministicPlan.Get on
-    // script.GetType()), which no static reference roots. Without this, GetFields returns nothing
-    // under NativeAOT, the plan comes out empty, and capturing/restoring a script silently does
-    // nothing instead of failing loudly. Registering the type is not enough - that keeps the type,
-    // not its members.
-    public void RegisterScript<[DynamicallyAccessedMembers(
-            DynamicallyAccessedMemberTypes.PublicFields |
-            DynamicallyAccessedMemberTypes.NonPublicFields)] T>()  where T : Script, new()
+    // All includes private fields declared by script base classes. PublicFields | NonPublicFields
+    // on T alone keeps only the fields returned by T.GetFields, which omits those private bases.
+    public void RegisterScript<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.All)] T>()
+        where T : Script, new()
     {
         InitSchema();
         if (typeSet.Add(typeof(T))) {

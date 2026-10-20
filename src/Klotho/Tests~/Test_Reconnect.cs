@@ -164,6 +164,50 @@ public static class Test_Reconnect
 
     #region test
 
+    private sealed class DeviceIdProvider : IDeviceIdProvider
+    {
+        public string GetDeviceId() => "original-device";
+    }
+
+    [Test]
+    public static void ReconnectCredentials_ConfiguredBeforeHandshakeBindTheOriginalDevice()
+    {
+        using var match = Match.Start(new DeviceIdProvider());
+        for (int frame = 0; frame < FramesBeforeDrop; frame++) match.Pump();
+        var credentials = match.DropClient(1, match.Clients[1].LocalPlayerId);
+        Assert.AreEqual("original-device", credentials.DeviceId);
+        for (int frame = 0; frame < FramesWhileAway; frame++) match.Pump();
+        credentials.DeviceId = "different-device";
+
+        var returned = match.TryReconnect(credentials, out var failure);
+
+        Assert.IsNull(returned, "the initial handshake omitted the device binding, accepting a different device");
+        Assert.IsInstanceOf<ReconnectFailedException>(failure);
+        Assert.AreEqual(ReconnectRejectReason.DeviceMismatch, ((ReconnectFailedException)failure).Reason);
+    }
+
+    [Test]
+    public static void Reconnect_UsesAuthoritativeConfigBeforeRestoringWorld()
+    {
+        using var match = Match.Start();
+        for (int frame = 0; frame < FramesBeforeDrop; frame++) match.Pump();
+        int playerId = match.Clients[1].LocalPlayerId;
+        var credentials = match.DropClient(1, playerId);
+        for (int frame = 0; frame < FramesWhileAway; frame++) match.Pump();
+        var local = NewSimulationConfig();
+        local.TickIntervalMs = 20;
+        local.InputDelayTicks = 4;
+        local.MaxRollbackTicks = 8;
+
+        var returned = match.Reconnect(credentials, local);
+
+        Assert.AreEqual(TickIntervalMs, returned.Engine.TickInterval);
+        Assert.AreEqual(2, returned.Engine.InputDelay);
+        Assert.AreEqual(NewSimulationConfig().GetSnapshotCapacity(), returned.Simulation.RollbackCapacity);
+        match.PumpUntil(() => returned.IsCaughtUp, "the returning client never caught up");
+        Assert.AreEqual(0, returned.ResyncCount);
+    }
+
     /// <summary>
     /// A client that drops out and comes back resumes its own player slot with the current world.
     /// </summary>
@@ -399,7 +443,7 @@ public static class Test_Reconnect
         private readonly List<FrifloKlothoClient> live  = new();
         private readonly List<LoopbackTransport>  links = new();
 
-        internal static Match Start()
+        internal static Match Start(IDeviceIdProvider deviceIdProvider = null)
         {
             var hub        = new LoopbackHub();
             var serverLink = hub.CreateServer();
@@ -424,7 +468,7 @@ public static class Test_Reconnect
                 // Before the match starts, deliberately: the credentials are written when it does,
                 // so a store attached later would still be empty when the client drops.
                 match.Stores[i] = new MemoryCredentialsStore();
-                client.SetReconnectCredentialsStore(match.Stores[i], AppVersion);
+                client.SetReconnectCredentialsStore(match.Stores[i], AppVersion, deviceIdProvider);
                 hub.Connect(link);
                 match.links.Add(link);
                 match.live.Add(client);
@@ -486,9 +530,9 @@ public static class Test_Reconnect
         }
 
         /// <summary>Bring a dropped client back, failing the test if the server refuses.</summary>
-        internal FrifloKlothoClient Reconnect(PersistedReconnectCredentials credentials)
+        internal FrifloKlothoClient Reconnect(PersistedReconnectCredentials credentials, SimulationConfig localConfig = null)
         {
-            var client = TryReconnect(credentials, out var failure);
+            var client = TryReconnect(credentials, out var failure, localConfig);
             if (client == null) {
                 Assert.Fail($"the reconnect was refused: {failure?.Message}");
             }
@@ -503,7 +547,8 @@ public static class Test_Reconnect
         /// the world and the roster, and the engine has to be constructed against them. Only the
         /// handshake differs — this one presents credentials naming a slot the server is holding.
         /// </remarks>
-        internal FrifloKlothoClient TryReconnect(PersistedReconnectCredentials credentials, out Exception failure)
+        internal FrifloKlothoClient TryReconnect(PersistedReconnectCredentials credentials, out Exception failure,
+            SimulationConfig localConfig = null)
         {
             var link = hub.CreateClient();
 
@@ -532,7 +577,7 @@ public static class Test_Reconnect
                 "the server treated this as a fresh join - the reconnect path was not exercised");
 
             var client = FrifloKlothoClient.JoinRunningMatch(
-                result, new EntityStore(), NewSimulationConfig(), NewSessionConfig(),
+                result, new EntityStore(), localConfig ?? NewSimulationConfig(), NewSessionConfig(),
                 new Callbacks(), RegisterCommands);
             live.Add(client);
             return client;

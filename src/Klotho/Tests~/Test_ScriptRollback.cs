@@ -36,6 +36,42 @@ public static class Test_ScriptRollback
         public int    distance;
     }
 
+    private abstract class BaseCooldown : Script
+    {
+        public int Remaining { get; set; }
+    }
+
+    private sealed class InheritedCooldown : BaseCooldown
+    {
+        public int visible;
+    }
+
+    /// <summary>Private backing fields declared on a base script are still simulation state.</summary>
+    [Test]
+    public static void InheritedPrivateFields_ParticipateInHashRollbackAndFullState()
+    {
+        var simulation = SampleSimulation.Create();
+        var entity = NewEntity(simulation.Store);
+        var script = new InheritedCooldown { Remaining = 5, visible = 3 };
+        entity.AddScript(script);
+        long before = simulation.GetStateHash();
+        simulation.SaveSnapshot();
+
+        script.Remaining = 99;
+        Assert.AreNotEqual(before, simulation.GetStateHash(),
+            "a private base field changed without changing the hash");
+        simulation.Rollback(simulation.CurrentTick);
+        Assert.AreEqual(5, script.Remaining, "rollback skipped the private base field");
+        Assert.AreSame(script, entity.GetScript<InheritedCooldown>());
+
+        var receiver = SampleSimulation.Create();
+        receiver.RestoreFromFullState(simulation.SerializeFullState());
+        var restored = receiver.Store.GetEntityById(entity.Id).GetScript<InheritedCooldown>();
+        Assert.AreEqual(5, restored.Remaining, "full state skipped the private base field");
+        Assert.AreEqual(3, restored.visible);
+        Assert.AreEqual(before, receiver.GetStateHash());
+    }
+
     private static Entity NewEntity(EntityStore store) =>
         store.CreateEntity(new Pos { x = FP64.One, y = FP64.One });
 

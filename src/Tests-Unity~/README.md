@@ -31,7 +31,7 @@ NuGetForUnity **must be installed** in Unity to add Friflo.Engine.ECS as nuget p
 
 Running unit tests is only relevant for development of the library.
 
-Unit tests are used as symlink from `Tests folder`.  
+Unit tests are used as symlink from the `src/Tests~` folder.
 These tests are executed as **EditMode** tests in Unity.
 
 
@@ -40,12 +40,12 @@ These tests are executed as **EditMode** tests in Unity.
 The symlink is already committed to git repository.  
 To create a symlink manually execute the steps below.
 
-`Unity/Assets/Scripts/Tests` -> `Tests`
+`src/Tests-Unity~/Assets/Scripts/Tests` -> `src/Tests~`
 
 Create symlink on windows
 ```
-cd Unity/Assets/Scripts
-mklink /D Tests ..\..\..\Tests
+cd src/Tests-Unity~/Assets/Scripts
+mklink /D Tests ..\..\..\Tests~
 ```
 
 ### Run Tests

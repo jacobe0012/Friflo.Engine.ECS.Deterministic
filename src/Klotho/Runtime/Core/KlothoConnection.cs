@@ -180,13 +180,29 @@ namespace xpTURN.Klotho.Core
         }
 
         /// <summary>
-        /// Cancels the connection and cleans up resources.
+        /// Cancels the handshake and detaches its handlers.
         /// </summary>
+        /// <remarks>
+        /// After successful completion, pending receives belong to ConnectionResult, not this
+        /// handshake. Adopt the result in a network service or dispose the result if abandoning it.
+        /// The caller retains ownership of the transport.
+        /// </remarks>
         public void Dispose()
         {
             _transport.OnConnected -= HandleConnected;
             _transport.OnDataReceived -= HandleDataReceived;
             _transport.OnDisconnected -= HandleDisconnected;
+        }
+
+        /// <summary>
+        /// Sets the device identity for a pending normal join. Call before the transport raises
+        /// OnConnected, which sends PlayerJoinMessage. Reconnect uses the persisted credentials.
+        /// </summary>
+        public void SetDeviceIdProvider(IDeviceIdProvider deviceIdProvider)
+        {
+            if (_completed)
+                throw new InvalidOperationException("the connection handshake has already completed");
+            _deviceId = deviceIdProvider?.GetDeviceId() ?? string.Empty;
         }
 
         private void HandleConnected()
@@ -485,6 +501,9 @@ namespace xpTURN.Klotho.Core
                 _result.ReconnectPayload.FullStateHash = _pendingFullState.Value.hash;
             }
 
+            // Keep receiving before detaching the handshake. PollEvents may deliver the next
+            // verified tick in this same call, before the caller constructs its session.
+            _result.BeginReceiveHandoff();
             _completed = true;
             Dispose();
 
@@ -521,7 +540,17 @@ namespace xpTURN.Klotho.Core
                 $"EventDispatchWarnMs={sc.EventDispatchWarnMs}, " +
                 $"TickDriftWarnMultiplier={sc.TickDriftWarnMultiplier}");
 
-            _onCompleted?.Invoke(_result);
+            if (_onCompleted == null)
+            {
+                _result.Dispose();
+                return;
+            }
+            try { _onCompleted(_result); }
+            catch
+            {
+                _result.Dispose();
+                throw;
+            }
         }
     }
 }

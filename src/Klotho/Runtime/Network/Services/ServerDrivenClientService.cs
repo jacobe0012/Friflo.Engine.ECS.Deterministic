@@ -18,6 +18,7 @@ namespace xpTURN.Klotho.Network
         private INetworkTransport _transport;
         private ICommandFactory _commandFactory;
         private MessageSerializer _messageSerializer;
+        private ConnectionReceiveBuffer _connectionReceives;
 
         private IKlothoEngine _engine;
         // Buffered extra-delay value when handshake handlers (Sync/LateJoin/Reconnect) fire before
@@ -214,6 +215,7 @@ namespace xpTURN.Klotho.Network
         /// </summary>
         public void InitializeFromConnection(ConnectionResult result, ICommandFactory commandFactory, IKLogger logger, int roomId = -1)
         {
+            result.ValidateForAdoption();
             _logger = logger;
             _transport = result.Transport;
             _commandFactory = commandFactory;
@@ -280,6 +282,9 @@ namespace xpTURN.Klotho.Network
             }
             ApplyOrPendExtraDelay(seedExtraDelay, seedSource);
 
+            // Initialization callbacks above may throw. Keep ownership on the result until all
+            // fallible setup has succeeded, so abandoning that result still releases its listener.
+            _connectionReceives = result.TakeReceiveBuffer();
             _transport.OnDataReceived += HandleDataReceived;
             _transport.OnConnected += HandleConnected;
             _transport.OnDisconnected += HandleDisconnected;
@@ -414,6 +419,8 @@ namespace xpTURN.Klotho.Network
 
         public void LeaveRoom(bool keepReconnectCredentials = false)
         {
+            _connectionReceives?.Dispose();
+            _connectionReceives = null;
             _transport.OnDataReceived -= HandleDataReceived;
             _transport.OnConnected -= HandleConnected;
             _transport.OnDisconnected -= HandleDisconnected;
@@ -677,6 +684,12 @@ namespace xpTURN.Klotho.Network
 
         public void Update()
         {
+            if (_connectionReceives != null)
+            {
+                var pending = _connectionReceives;
+                pending.Drain(HandleReceivedMessage);
+                if (_connectionReceives == pending) _connectionReceives = null;
+            }
             _transport?.PollEvents();
 
             UpdateReconnect();
@@ -698,6 +711,14 @@ namespace xpTURN.Klotho.Network
         // ── Message handling ─────────────────────────────────────
 
         private void HandleDataReceived(int peerId, byte[] data, int length)
+        {
+            // The handoff listener already copied this packet. Do not dispatch it ahead of older
+            // queued receives, or before the engine has restored its initial FullState.
+            if (_connectionReceives != null) return;
+            HandleReceivedMessage(peerId, data, length);
+        }
+
+        private void HandleReceivedMessage(int peerId, byte[] data, int length)
         {
             var message = _messageSerializer.Deserialize(data, length);
             if (message == null)

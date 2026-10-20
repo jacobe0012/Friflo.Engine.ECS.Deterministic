@@ -36,9 +36,10 @@ internal sealed class FrifloStateSerializer
     /// field from one 64-bit word to all four, so a peer mixing the two would misread every
     /// archetype header from that field onwards. Version 4 added RecycleIds and StoreRoot: both are
     /// public EntityStore state that changes future allocation/tree behaviour despite living outside
-    /// archetype component data.
+    /// archetype component data. Version 5 includes private fields declared by script base classes
+    /// in the deterministic leaf layout; accepting an older payload could silently omit that state.
     /// </summary>
-    private const int FormatVersion = 4;
+    private const int FormatVersion = 5;
 
     private readonly EntityStore store;
 

@@ -5,8 +5,53 @@ namespace xpTURN.Klotho.Core
     /// Encapsulates the completed state of the handshake + SimulationConfig reception.
     /// Injected into KlothoSessionSetup.Connection and handed off to NetworkService.
     /// </summary>
-    public class ConnectionResult
+    /// <remarks>
+    /// Receives after completion are buffered until the adopting service's first Update, so the
+    /// caller may construct its session after the handshake poll returns. The handoff is bounded
+    /// to 1024 packets / 4 MiB and fails explicitly if exceeded. Dispose an unadopted result to
+    /// release its pending data and handlers without disconnecting the caller-owned transport.
+    /// </remarks>
+    public class ConnectionResult : System.IDisposable
     {
+        private ConnectionReceiveBuffer _receiveBuffer;
+        private bool _receiveBufferTaken;
+        private bool _disposed;
+
+        internal void BeginReceiveHandoff()
+        {
+            _receiveBuffer = new ConnectionReceiveBuffer(Transport);
+        }
+
+        internal void ValidateForAdoption()
+        {
+            if (_disposed) throw new System.ObjectDisposedException(nameof(ConnectionResult));
+            if (_receiveBufferTaken)
+                throw new System.InvalidOperationException("the connection result has already been adopted by a service");
+            _receiveBuffer?.ThrowIfFailed();
+        }
+
+        internal ConnectionReceiveBuffer TakeReceiveBuffer()
+        {
+            ValidateForAdoption();
+            _receiveBufferTaken = true;
+            var buffer = _receiveBuffer;
+            _receiveBuffer = null;
+            return buffer;
+        }
+
+        /// <summary>Release a completed handshake that will not be adopted by a network service.</summary>
+        /// <remarks>
+        /// Does not disconnect the caller-owned transport. Once adopted, the service owns the
+        /// pending receives and disposing this result does not discard them.
+        /// </remarks>
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+            _receiveBuffer?.Dispose();
+            _receiveBuffer = null;
+        }
+
         /// <summary>
         /// The (already-connected) transport used for the handshake.
         /// </summary>

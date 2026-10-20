@@ -40,6 +40,56 @@ public static class Program
         public Entity GetRelationKey() => target;
     }
 
+    private struct EntityReference : IComponent
+    {
+        public Entity target;
+        public int    weight;
+    }
+
+    private readonly struct ImmutableReference : IComponent
+    {
+        public readonly Entity target;
+        public readonly int    weight;
+        public ImmutableReference(Entity target, int weight) { this.target = target; this.weight = weight; }
+    }
+
+    private struct NestedImmutableReference : IComponent
+    {
+        public ImmutableReference value;
+    }
+
+    private struct UnregisteredState
+    {
+        public int value;
+    }
+
+    private struct UnregisteredReference : IComponent
+    {
+        public Entity            target;
+        public UnregisteredState state;
+    }
+
+    private struct NestedState
+    {
+        public long amount;
+    }
+
+    private struct NestedReference : IComponent
+    {
+        public Entity      target;
+        public NestedState state;
+    }
+
+    private abstract class BaseCooldown : Script
+    {
+        public int Remaining { get; set; }
+    }
+
+    private sealed class InheritedCooldown : BaseCooldown
+    {
+        public NestedState state;
+    }
+
     private class Cooldown : Script
     {
         public int    remaining;
@@ -62,6 +112,13 @@ public static class Program
         RelationHashIsIdentityBased();
         FullStateRoundTrips();
         FullStateCarriesScriptsAndHierarchy();
+        EntityComponentFieldsSurviveTrimming();
+        NestedAndInheritedFieldsSurviveTrimming();
+        ReadonlyAndDefaultEntityFieldsRoundTrip();
+        NegativeRevisionRoundTripsAcrossRuntimes();
+        if (!RuntimeFeature.IsDynamicCodeSupported) {
+            MissingNestedRegistrationFailsLoud();
+        }
 
         Console.WriteLine(failures == 0 ? "AOT smoke: PASS" : $"AOT smoke: FAIL ({failures})");
         return failures == 0 ? 0 : 1;
@@ -87,8 +144,14 @@ public static class Program
     {
         var aot = new NativeAOT();
         aot.RegisterComponent<Position>();
+        aot.RegisterComponent<EntityReference>();
+        aot.RegisterComponent<NestedReference>();
+        aot.RegisterComponent<ImmutableReference>();
+        aot.RegisterComponent<NestedImmutableReference>();
+        aot.RegisterComponent<UnregisteredReference>();
+        aot.RegisterDeterministicType<NestedState>();
+        aot.RegisterScript<InheritedCooldown>();
         aot.RegisterIndexedComponentStruct<Team, int>();
-        aot.RegisterRelation<Targeting, Entity>();
         aot.RegisterLinkRelation<Targeting>();
         aot.RegisterScript<Cooldown>();
         aot.CreateSchema();
@@ -167,9 +230,17 @@ public static class Program
 
         var (data, hash) = source.SerializeFullStateWithHash();
 
-        var target = NewSimulation(out _);
+        var target = NewSimulation(out var targetStore);
         target.RestoreFromFullState(data);
         Check(target.GetStateHash() == hash, "full state round-trips with relations");
+        var restoredOwner = targetStore.GetEntityById(a.Id);
+        var restoredTarget = targetStore.GetEntityById(b.Id);
+        var restoredRelations = restoredOwner.GetRelations<Targeting>();
+        Check(restoredRelations.Length == 1 && restoredRelations[0].target == restoredTarget,
+              "relation target fields survive an AOT full state");
+        restoredTarget.DeleteEntity();
+        Check(restoredOwner.GetRelations<Targeting>().Length == 0,
+              "the most-specific AOT relation registration rebuilds incoming links");
     }
 
     /// <summary>
@@ -205,6 +276,120 @@ public static class Program
         var restored = restoredParent.GetScript<Cooldown>();
         Check(restored != null && restored.remaining == 11, "script field survives a full state");
         Check(restored != null && restored.source.Id == child.Id, "entity reference in a transferred script");
+    }
+
+    /// <summary>A statically used component still needs its field metadata rooted for the layout plan.</summary>
+    private static void EntityComponentFieldsSurviveTrimming()
+    {
+        var source = NewSimulation(out var store);
+        var target = store.CreateEntity();
+        var holder = store.CreateEntity(new EntityReference { target = target, weight = 7 });
+        long before = source.GetStateHash();
+        holder.GetComponent<EntityReference>().target = default;
+        Check(source.GetStateHash() != before, "an Entity component retarget changes the AOT hash");
+        holder.GetComponent<EntityReference>().target = target;
+
+        var (data, hash) = source.SerializeFullStateWithHash();
+        var receiver = NewSimulation(out var receiverStore);
+        receiver.RestoreFromFullState(data);
+        var restored = receiverStore.GetEntityById(holder.Id).GetComponent<EntityReference>();
+        Check(restored.target == receiverStore.GetEntityById(target.Id) && restored.weight == 7,
+              "an Entity component's actual fields survive an AOT full state");
+        Check(receiver.GetStateHash() == hash, "Entity component full state hash agrees");
+    }
+
+    /// <summary>Registration must also preserve fields reached through structs and script bases.</summary>
+    private static void NestedAndInheritedFieldsSurviveTrimming()
+    {
+        var source = NewSimulation(out var store);
+        var target = store.CreateEntity();
+        var holder = store.CreateEntity(new NestedReference { target = target, state = new NestedState { amount = 13 } });
+        var script = new InheritedCooldown { Remaining = 5, state = new NestedState { amount = 17 } };
+        holder.AddScript(script);
+        long before = source.GetStateHash();
+        source.SaveSnapshot();
+        script.Remaining = 99;
+        Check(source.GetStateHash() != before, "private inherited script fields affect the AOT hash");
+        source.Rollback(source.CurrentTick);
+        Check(script.Remaining == 5, "private inherited script fields survive an AOT rollback");
+
+        before = source.GetStateHash();
+        holder.GetComponent<NestedReference>().state.amount = 100;
+        Check(source.GetStateHash() != before, "nested component fields affect the AOT hash");
+        source.Rollback(source.CurrentTick);
+
+        var receiver = NewSimulation(out var receiverStore);
+        receiver.RestoreFromFullState(source.SerializeFullState());
+        var restored = receiverStore.GetEntityById(holder.Id);
+        Check(restored.GetComponent<NestedReference>().state.amount == 13,
+              "nested component fields survive an AOT full state");
+        var restoredScript = restored.GetScript<InheritedCooldown>();
+        Check(restoredScript.Remaining == 5 && restoredScript.state.amount == 17,
+              "nested and inherited script fields survive an AOT full state");
+    }
+
+    /// <summary>Readonly fields and null entity sentinels must survive the reflection read path too.</summary>
+    private static void ReadonlyAndDefaultEntityFieldsRoundTrip()
+    {
+        var source = NewSimulation(out var store);
+        var target = store.CreateEntity();
+        var holder = store.CreateEntity(new ImmutableReference(target, 7),
+            new NestedImmutableReference { value = new ImmutableReference(target, 11) },
+            new EntityReference { weight = 3 });
+        var script = new Cooldown();
+        holder.AddScript(script);
+        source.SaveSnapshot();
+        script.source = target;
+        source.Rollback(source.CurrentTick);
+        Check(script.source == default, "default Entity equality survives an AOT script rollback");
+
+        var receiver = NewSimulation(out var receiverStore);
+        receiver.RestoreFromFullState(source.SerializeFullState());
+        var restored = receiverStore.GetEntityById(holder.Id);
+        var direct = restored.GetComponent<ImmutableReference>();
+        var nested = restored.GetComponent<NestedImmutableReference>().value;
+        Check(direct.target == receiverStore.GetEntityById(target.Id) && direct.weight == 7,
+              "readonly Entity fields survive an AOT full state");
+        Check(nested.target == direct.target && nested.weight == 11,
+              "nested readonly fields survive an AOT full state");
+        Check(restored.GetComponent<EntityReference>().target == default,
+              "default Entity equality survives an AOT component full state");
+    }
+
+    /// <summary>The signature is compared between this native executable and the same JIT build.</summary>
+    private static void NegativeRevisionRoundTripsAcrossRuntimes()
+    {
+        var source = NewSimulation(out var store);
+        var target = store.CreateEntity();
+        for (int i = 0; i <= short.MaxValue; i++) {
+            target.DeleteEntity();
+            target = store.CreateEntity();
+        }
+        Check(target.Revision == short.MinValue, "entity reuse reaches a negative revision");
+        var holder = store.CreateEntity(new EntityReference { target = target, weight = -7 });
+        var (data, hash) = source.SerializeFullStateWithHash();
+        var receiver = NewSimulation(out var receiverStore);
+        receiver.RestoreFromFullState(data);
+        Check(receiverStore.GetEntityById(holder.Id).GetComponent<EntityReference>().target ==
+              receiverStore.GetEntityById(target.Id), "a negative Entity revision survives a full state");
+        Check(receiver.GetStateHash() == hash, "negative revision full state hash agrees");
+        Console.WriteLine($"CROSS_RUNTIME_NEGATIVE_REVISION_HASH={hash}");
+    }
+
+    /// <summary>A partial plan is not proof that all nested state survived trimming.</summary>
+    private static void MissingNestedRegistrationFailsLoud()
+    {
+        var source = NewSimulation(out var store);
+        var target = store.CreateEntity();
+        store.CreateEntity(new UnregisteredReference { target = target, state = new UnregisteredState { value = 7 } });
+        try {
+            source.GetStateHash();
+            Check(false, "an unregistered nested type is rejected before hashing partial state");
+        }
+        catch (NotSupportedException error) {
+            Check(error.Message.Contains("RegisterDeterministicType<UnregisteredState>()"),
+                  "missing metadata names the nested type and its required registration");
+        }
     }
 
     // ------------------------------------------------------------------ helpers

@@ -17,7 +17,7 @@
   </ItemGroup>
 
   <PropertyGroup>
-    <RuntimeRoot>..\..\com.xpturn.klotho\Runtime</RuntimeRoot>
+    <RuntimeRoot>..\..\Runtime</RuntimeRoot>
   </PropertyGroup>
 
   <ItemGroup>
@@ -30,6 +30,7 @@
              Exclude="$(RuntimeRoot)\Deterministic\Physics\FPStaticColliderSerializer.cs"
              Link="Physics\%(Filename)%(Extension)" />
     <Compile Include="$(RuntimeRoot)\Deterministic\FPHash.cs" Link="FPHash.cs" />
+    <Compile Include="$(RuntimeRoot)\ECS\Core\FixedString.cs" Link="FixedString.cs" />
     <Compile Include="$(RuntimeRoot)\Core\Attributes\PrimitiveAttribute.cs" Link="PrimitiveAttribute.cs" />
     <Compile Include="$(RuntimeRoot)\Core\ICommand.cs" Link="ICommand.cs" />
     <Compile Include="$(RuntimeRoot)\Core\Pool\ListPool.cs" Link="ListPool.cs" />

@@ -140,6 +140,7 @@ namespace xpTURN.Klotho.Network
         private INetworkTransport _transport;
         private ICommandFactory _commandFactory;
         private MessageSerializer _messageSerializer;
+        private ConnectionReceiveBuffer _connectionReceives;
 
         private readonly List<PlayerInfo> _players = new List<PlayerInfo>();
         private readonly Dictionary<int, int> _peerToPlayer = new Dictionary<int, int>();
@@ -666,6 +667,7 @@ namespace xpTURN.Klotho.Network
         /// </summary>
         public void InitializeFromConnection(ConnectionResult result, ICommandFactory commandFactory, IKLogger logger)
         {
+            result.ValidateForAdoption();
             _logger = logger;
             _transport = result.Transport;
             _commandFactory = commandFactory;
@@ -707,6 +709,9 @@ namespace xpTURN.Klotho.Network
                 _pendingExtraDelaySource = ResolveExtraDelaySource(result.Kind);
             }
 
+            // Claim only after initialization callbacks have succeeded; the result can still
+            // release its pending data if one of those callbacks throws.
+            _connectionReceives = result.TakeReceiveBuffer();
             // Wire up network events (same as Initialize)
             _transport.OnDataReceived += HandleDataReceived;
             _transport.OnPeerConnected += HandlePeerConnected;
@@ -782,6 +787,8 @@ namespace xpTURN.Klotho.Network
 
         public void LeaveRoom(bool keepReconnectCredentials = false)
         {
+            _connectionReceives?.Dispose();
+            _connectionReceives = null;
             if (_transport != null)
             {
                 _transport.OnDataReceived -= HandleDataReceived;
@@ -990,10 +997,15 @@ namespace xpTURN.Klotho.Network
             long startTime = _sharedClock.SharedNow + _sessionConfig.CountdownDurationMs;
             _gameStartTime = startTime;
 
+            // Resolve the authored request at match start; 0 asks for an automatic seed.
+            int effectiveSeed = _sessionConfig.RandomSeed != 0
+                ? _sessionConfig.RandomSeed
+                : Environment.TickCount;
+
             var msg = new GameStartMessage
             {
                 StartTime = startTime,
-                RandomSeed = Environment.TickCount,
+                RandomSeed = effectiveSeed,
                 MaxPlayers = _players.Count,
                 MinPlayers = _sessionConfig.MinPlayers,
                 MaxSpectators = _sessionConfig.MaxSpectators,
@@ -1203,6 +1215,12 @@ namespace xpTURN.Klotho.Network
 
         public void Update()
         {
+            if (_connectionReceives != null)
+            {
+                var pending = _connectionReceives;
+                pending.Drain(HandleReceivedMessage);
+                if (_connectionReceives == pending) _connectionReceives = null;
+            }
             _transport?.PollEvents();
 
             // Check countdown completion (common to host/client)
@@ -1264,6 +1282,12 @@ namespace xpTURN.Klotho.Network
         }
 
         private void HandleDataReceived(int peerId, byte[] data, int length)
+        {
+            if (_connectionReceives != null) return;
+            HandleReceivedMessage(peerId, data, length);
+        }
+
+        private void HandleReceivedMessage(int peerId, byte[] data, int length)
         {
             if (_pendingPeers.Contains(peerId))
             {
@@ -1587,10 +1611,10 @@ namespace xpTURN.Klotho.Network
             // Apply server-authoritative SessionConfig fields in place. Engine and NetworkService
             // share the same SessionConfig reference, so mutating the instance propagates to both
             // readers automatically. Match-start one-shot; SessionConfig stays immutable afterward.
-            // Host self-dispatch: msg values originate from _sessionConfig, so this is effectively a no-op.
+            // RandomSeed remains the authored request; expose the effective value on the service
+            // and engine instead of freezing an automatic request to this match's seed.
             if (_sessionConfig is SessionConfig cfg)
             {
-                cfg.RandomSeed = msg.RandomSeed;
                 cfg.MaxPlayers = msg.MaxPlayers;
                 cfg.MinPlayers = msg.MinPlayers;
                 cfg.MaxSpectators = msg.MaxSpectators;

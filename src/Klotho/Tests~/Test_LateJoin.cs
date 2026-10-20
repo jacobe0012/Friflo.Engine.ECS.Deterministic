@@ -119,6 +119,8 @@ public static class Test_LateJoin
     /// <summary>Game side of the simulation. Only the server's world seeding ever runs.</summary>
     private sealed class Callbacks : IFrifloSimulationCallbacks, IFrifloCommandApplier
     {
+        internal readonly List<int> LastCommandPlayers = new();
+
         /// <inheritdoc />
         public void RegisterSystems(SystemRoot systems, EntityStore store) => systems.Add(new DriftSystem());
 
@@ -134,13 +136,18 @@ public static class Test_LateJoin
             // rebuild and re-running this test is how that was found - it passed. At two children
             // `start` becomes a pool offset, which is the case that breaks.
             for (int playerId = 1; playerId <= StartingPlayers; playerId++) {
-                var avatar = store.CreateEntity(new Avatar { playerId = playerId, x = FP64.Zero, y = FP64.Zero });
-                var held   = store.CreateEntity(new Held { slot = playerId });
-                var spare  = store.CreateEntity(new Held { slot = playerId + 100 });
-                avatar.AddChild(held);
-                avatar.AddChild(spare);
-                avatar.AddScript(new Loadout { charges = playerId * 3, held = held });
+                AddAvatar(store, playerId);
             }
+        }
+
+        private static void AddAvatar(EntityStore store, int playerId)
+        {
+            var avatar = store.CreateEntity(new Avatar { playerId = playerId, x = FP64.Zero, y = FP64.Zero });
+            var held   = store.CreateEntity(new Held { slot = playerId });
+            var spare  = store.CreateEntity(new Held { slot = playerId + 100 });
+            avatar.AddChild(held);
+            avatar.AddChild(spare);
+            avatar.AddScript(new Loadout { charges = playerId * 3, held = held });
         }
 
         /// <inheritdoc />
@@ -155,9 +162,14 @@ public static class Test_LateJoin
         /// <inheritdoc />
         public void ApplyCommands(EntityStore store, List<ICommand> commands, int tick)
         {
+            LastCommandPlayers.Clear();
             for (int i = 0; i < commands.Count; i++) {
+                LastCommandPlayers.Add(commands[i].PlayerId);
+                if (commands[i] is PlayerJoinCommand joined && FindAvatar(store, joined.JoinedPlayerId).IsNull) {
+                    AddAvatar(store, joined.JoinedPlayerId);
+                }
                 if (commands[i] is not NudgeCommand nudge) {
-                    continue;   // EmptyCommand, or a framework system command
+                    continue;
                 }
                 int owner = nudge.PlayerId;
                 store.Query<Avatar>().ForEachEntity((ref Avatar avatar, Entity _) => {
@@ -240,6 +252,70 @@ public static class Test_LateJoin
         foreach (var client in match.StartingClients) {
             Assert.AreEqual(0, client.ResyncCount, "an existing client was resynced when someone joined late");
         }
+    }
+
+    [Test]
+    public static void LateJoin_UsesAuthoritativeSimulationConfigBeforeAllocatingSnapshots()
+    {
+        using var match = Match.Start();
+        for (int frame = 0; frame < FramesBeforeJoin; frame++) {
+            match.Pump();
+        }
+        var local = NewSimulationConfig();
+        local.TickIntervalMs = 20;
+        local.InputDelayTicks = 4;
+        local.MaxRollbackTicks = 10;
+        var joiner = match.JoinLate(local);
+
+        Assert.AreEqual(TickIntervalMs, joiner.Engine.TickInterval);
+        Assert.AreEqual(2, joiner.Engine.InputDelay);
+        Assert.AreEqual(30, joiner.Engine.SimulationConfig.MaxRollbackTicks);
+        Assert.AreEqual(NewSimulationConfig().GetSnapshotCapacity(), joiner.Simulation.RollbackCapacity,
+            "the ring must be allocated from the received config, not resized after catchup starts");
+        match.PumpUntil(() => joiner.IsCaughtUp, "the joiner never caught up with the authoritative config");
+        Assert.AreEqual(0, joiner.ResyncCount);
+    }
+
+    [Test]
+    public static void LateJoin_PlayerParticipatesInExistingClientsPrediction()
+    {
+        using var match = Match.Start();
+        for (int frame = 0; frame < FramesBeforeJoin; frame++) {
+            match.Pump();
+        }
+        var joiner = match.JoinLate();
+        var predicted = new bool[StartingPlayers];
+        for (int i = 0; i < StartingPlayers; i++) {
+            int index = i;
+            match.StartingClients[i].Engine.OnTickExecutedWithState += (_, state) => {
+                if (state != FrameState.Predicted) return;
+                int occurrences = 0;
+                foreach (int playerId in match.StartingCallbacks[index].LastCommandPlayers) {
+                    if (playerId == joiner.LocalPlayerId) occurrences++;
+                }
+                if (occurrences != 0) {
+                    Assert.AreEqual(1, occurrences, "rollback replay duplicated the joining player's roster entry");
+                    predicted[index] = true;
+                }
+            };
+        }
+
+        match.PumpUntil(() => joiner.IsCaughtUp, "the joiner never caught up");
+        for (int frame = 0; frame < FramesAfterJoin; frame++) {
+            match.Pump();
+        }
+
+        Assert.IsFalse(FindAvatar(match.Server.Store, joiner.LocalPlayerId).IsNull,
+            "the join command never created the joining player's world state");
+        Assert.Greater(FindAvatar(match.Server.Store, joiner.LocalPlayerId).GetComponent<Avatar>().y.RawValue, 0L,
+            "the joining player's actual input never affected the authoritative world");
+        for (int i = 0; i < StartingPlayers; i++) {
+            Assert.IsTrue(predicted[i], "an existing client's engine never predicted input for the new player");
+            Assert.Greater(match.StartingClients[i].Simulation.RollbackCount, 0,
+                "the roster must also survive the verified-state rollback/replay path");
+            Assert.AreEqual(0, match.StartingClients[i].ResyncCount);
+        }
+        Assert.AreEqual(0, joiner.ResyncCount);
     }
 
     /// <summary>
@@ -374,6 +450,7 @@ public static class Test_LateJoin
         internal FrifloKlothoServer         Server          { get; private init; }
         /// <summary>The clients the match started with.</summary>
         internal FrifloKlothoClient[]       StartingClients { get; private init; }
+        internal Callbacks[]               StartingCallbacks { get; private init; }
 
         private LoopbackHub                 hub;
         private LoopbackTransport           serverLink;
@@ -391,12 +468,14 @@ public static class Test_LateJoin
 
             var match = new Match {
                 Server = server, StartingClients = new FrifloKlothoClient[StartingPlayers],
+                StartingCallbacks = new Callbacks[StartingPlayers],
             };
             match.hub        = hub;
             match.serverLink = serverLink;
 
             for (int i = 0; i < StartingPlayers; i++) {
-                match.StartingClients[i] = match.AddClient();
+                match.StartingCallbacks[i] = new Callbacks();
+                match.StartingClients[i] = match.AddClient(match.StartingCallbacks[i]);
             }
 
             match.PumpUntil(
@@ -426,12 +505,12 @@ public static class Test_LateJoin
         }
 
         /// <summary>Connect one more client into a match that has not started yet.</summary>
-        internal FrifloKlothoClient AddClient()
+        internal FrifloKlothoClient AddClient(Callbacks callbacks)
         {
             var link = hub.CreateClient();
             var client = FrifloKlothoClient.Connect(
                 new EntityStore(), link, NewSimulationConfig(), NewSessionConfig(),
-                new Callbacks(), RegisterCommands);
+                callbacks, RegisterCommands);
             // Only now that the client's handlers are attached.
             hub.Connect(link);
             links.Add(link);
@@ -452,7 +531,7 @@ public static class Test_LateJoin
         /// after the match started — the client sends the same <c>PlayerJoinMessage</c> either way.
         /// </para>
         /// </remarks>
-        internal FrifloKlothoClient JoinLate()
+        internal FrifloKlothoClient JoinLate(SimulationConfig localConfig = null)
         {
             var link = hub.CreateClient();
 
@@ -483,7 +562,7 @@ public static class Test_LateJoin
                 "the server treated this as a normal join - the match was not running yet, so nothing late-join was tested");
 
             var client = FrifloKlothoClient.JoinRunningMatch(
-                result, new EntityStore(), NewSimulationConfig(), NewSessionConfig(),
+                result, new EntityStore(), localConfig ?? NewSimulationConfig(), NewSessionConfig(),
                 new Callbacks(), RegisterCommands);
             clients.Add(client);
             return client;

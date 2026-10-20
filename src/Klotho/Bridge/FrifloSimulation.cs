@@ -121,6 +121,11 @@ public sealed class FrifloSimulation : ISimulation
         // events below remain visible to every system executed in this tick.
         store.ClearRecordedEvents();
         applyCommands?.Invoke(store, commands, CurrentTick);
+        for (int i = 0; i < commands.Count; i++) {
+            if (commands[i] is PlayerJoinCommand joined) {
+                OnPlayerJoined(joined.JoinedPlayerId, CurrentTick);
+            }
+        }
         systems.Update(default);
         CurrentTick++;
     }

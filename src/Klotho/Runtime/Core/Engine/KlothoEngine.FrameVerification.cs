@@ -18,7 +18,11 @@ namespace xpTURN.Klotho.Core
 #if DEVELOPMENT_BUILD || UNITY_EDITOR
         // Diagnostic — throttled break-cause log for chain advance stall.
         private long _lastChainBreakLogMs;
-        private int _lastChainBreakLoggedTick = -1;
+        // Throttle by missing-player slots: the frontier can advance every tick while the same
+        // peer stays delayed, so keying on the stalled tick does not suppress that common burst.
+        private ulong _lastChainBreakMissingMask;
+        private int _chainBreakSuppressed;
+        private int _chainBreakSuppressedFromTick = -1;
         // Single-shot buffer dump on first chain-break to bound log volume.
         private bool _chainBreakBufferDumped;
 #endif
@@ -96,34 +100,47 @@ namespace xpTURN.Klotho.Core
 #if DEVELOPMENT_BUILD || UNITY_EDITOR
         private void LogChainAdvanceBreak(int tick)
         {
-            // Throttle: log per-tick at most once per 1s, and skip duplicates of the same stalled tick.
-            long nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-            if (tick == _lastChainBreakLoggedTick && nowMs - _lastChainBreakLogMs < 1000)
-                return;
-            _lastChainBreakLogMs = nowMs;
-            _lastChainBreakLoggedTick = tick;
-
-            // Enumerate which playerIds have / are missing commands at the stalled tick. Track
-            // whether any *non-disconnected* player is missing: if every missing player is a
-            // confirmed-disconnected peer (_disconnectedPlayerIds — populated on guests via
-            // the player state notification), this stall is the expected "host proactive-fill is
-            // ~1 tick behind" condition during a disconnect window, so log it at Debug to avoid
-            // per-tick WARN spam. Any non-disconnected missing player = a real stall → Warning.
-            var sb = new System.Text.StringBuilder();
-            sb.Append("present=[");
-            bool first = true;
+            // Compute the cause before allocating a log message. The mask is only a throttle key;
+            // beyond 64 slots it may merge causes, but every player still affects severity and text.
+            ulong missingMask = 0;
             bool anyMissingNotDisconnected = false;
             for (int pi = 0; pi < _activePlayerIds.Count; pi++)
             {
                 int pid = _activePlayerIds[pi];
-                bool has = _inputBuffer.HasCommandForTick(tick, pid);
-                if (!has && !_disconnectedPlayerIds.Contains(pid))
+                if (_inputBuffer.HasCommandForTick(tick, pid)) continue;
+                if (pi < 64) missingMask |= 1UL << pi;
+                if (!_disconnectedPlayerIds.Contains(pid))
                     anyMissingNotDisconnected = true;
-                if (!first) sb.Append(',');
-                first = false;
-                sb.Append(pid).Append(has ? '✓' : '✗');
+            }
+
+            // A changed missing set is reported immediately; the same cause is capped at one line
+            // per second even when newly arrived input keeps moving the stalled frontier forward.
+            long nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            bool causeChanged = missingMask != _lastChainBreakMissingMask;
+            if (!causeChanged && nowMs - _lastChainBreakLogMs < 1000)
+            {
+                if (_chainBreakSuppressed++ == 0) _chainBreakSuppressedFromTick = tick;
+                return;
+            }
+            _lastChainBreakLogMs = nowMs;
+            _lastChainBreakMissingMask = missingMask;
+
+            var sb = new System.Text.StringBuilder();
+            sb.Append("present=[");
+            for (int pi = 0; pi < _activePlayerIds.Count; pi++)
+            {
+                int pid = _activePlayerIds[pi];
+                if (pi > 0) sb.Append(',');
+                sb.Append(pid).Append(_inputBuffer.HasCommandForTick(tick, pid) ? '✓' : '✗');
             }
             sb.Append(']');
+            if (_chainBreakSuppressed > 0)
+            {
+                sb.Append(" (+").Append(_chainBreakSuppressed).Append(" suppressed since tick=")
+                  .Append(_chainBreakSuppressedFromTick).Append(')');
+                _chainBreakSuppressed = 0;
+                _chainBreakSuppressedFromTick = -1;
+            }
 
             if (anyMissingNotDisconnected)
                 _logger?.KWarning($"[KlothoEngine][ChainBreak] stuck at tick={tick} (_lastVerifiedTick={_lastVerifiedTick}, CurrentTick={CurrentTick}, activeIds.Count={_activePlayerIds.Count}, recommendedExtraDelay={RecommendedExtraDelay}) {sb}");

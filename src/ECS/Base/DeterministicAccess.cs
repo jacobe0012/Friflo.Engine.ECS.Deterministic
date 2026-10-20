@@ -368,19 +368,18 @@ namespace Friflo.Engine.ECS
         private void RebuildIndexes()
         {
             var indexMap = extension.indexMap;
-            if (indexMap == null) {
-                return;
+            if (indexMap != null) {
+                foreach (var index in indexMap) {
+                    index?.ClearIndex();
+                }
+                // ClearIndex drops the only handles into these pools. Release the unreachable
+                // allocations as well, so repeated rollback can reuse their backing arrays.
+                foreach (var index in indexMap) {
+                    index?.ClearIdHeap();
+                }
             }
-            foreach (var index in indexMap) {
-                index?.ClearIndex();
-            }
-            // ClearIndex empties the value -> ids dictionaries, which drops the only references to
-            // the id arrays those dictionaries held. The arrays live in a pooled allocator that
-            // reclaims space only through an explicit delete, so without this the pool would grow
-            // by one allocation per indexed value per rollback and never shrink.
-            foreach (var index in indexMap) {
-                index?.ClearIdHeap();
-            }
+            // A fresh FullState receiver has no indexMap yet. Still visit its restored components:
+            // AddIndexRange creates each required index instead of leaving owner bits with no table.
             // Re-register every indexed component from its archetype's component data.
             var schema = Static.EntitySchema;
             for (int archIndex = 0; archIndex < ArchsCount; archIndex++) {

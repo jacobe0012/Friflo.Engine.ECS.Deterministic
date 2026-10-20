@@ -5,6 +5,10 @@
 > 第十二轮（房间生命周期 / Release 构建）、第十三轮（组件哈希按字读）、第十四轮（收益复测）2026-08-05
 > 来源：Klotho 0.7.1 @ `H:\Test\Git\Klotho-0.7.1`
 
+> **Unity-layout 后续修复（2026-10-19）**：当前分支的 FullState 为 **v5**，不与 v4 混用；
+> NativeAOT 嵌套值类型需调用 `RegisterDeterministicType<T>()`；SD 客户端先完成权威配置握手再构造引擎。
+> 下文保留历史阶段记录；当前使用合同见 [UNITY-LAYOUT.md](../UNITY-LAYOUT.md#deterministic-state-and-nativeaot-registration)。
+
 ---
 
 ## 实施结果（2026-08-04；第六至九轮 2026-08-05）

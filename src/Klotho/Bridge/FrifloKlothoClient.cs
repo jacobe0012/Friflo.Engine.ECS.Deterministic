@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Globalization;
 using Friflo.Engine.ECS;
 using Friflo.Engine.ECS.Systems;
 using xpTURN.Klotho.Core;
@@ -32,39 +31,46 @@ namespace Klotho.Friflo;
 /// </remarks>
 public sealed class FrifloKlothoClient : IDisposable
 {
-    private readonly KlothoEngine               engine;
+    private KlothoEngine                        engine;
     private readonly ServerDrivenClientService  networkService;
     private readonly CommandFactory             commandFactory;
-    private readonly FrifloSimulation           simulation;
+    private FrifloSimulation                    simulation;
     private readonly IFrifloSimulationCallbacks callbacks;
-    private readonly CommandSink                sink;
+    private CommandSink                         sink;
     private readonly IKLogger                   logger;
+    private readonly EntityStore                store;
+    private readonly ISessionConfig             sessionConfig;
+    private KlothoConnection                    connection;
+    private INetworkTransport                   connectingTransport;
+    private Exception                           connectionFailure;
+    private IReconnectCredentialsStore          credentialsStore;
 
     private bool stopped;
 
-    /// <summary>The lockstep engine driving prediction and rollback.</summary>
-    public KlothoEngine Engine => engine;
+    /// <summary>The lockstep engine driving prediction and rollback. Available after the handshake.</summary>
+    public KlothoEngine Engine => engine ?? throw EngineNotReady();
 
-    /// <summary>The network service: roster, phase, ready state.</summary>
-    public IKlothoNetworkService NetworkService => networkService;
+    /// <summary>The network service: roster, phase, ready state. Available after the handshake.</summary>
+    public IKlothoNetworkService NetworkService => engine != null ? networkService : throw EngineNotReady();
 
-    /// <summary>The simulation and its Friflo store.</summary>
-    public FrifloSimulation Simulation => simulation;
+    /// <summary>The simulation and its Friflo store. Available after the handshake.</summary>
+    public FrifloSimulation Simulation => simulation ?? throw EngineNotReady();
 
     /// <summary>
     /// The simulation store. Empty until the server's initial state arrives — see
     /// <see cref="HasWorld"/>. Do not mutate it outside a tick.
     /// </summary>
-    public EntityStore Store => simulation.Store;
+    public EntityStore Store => store;
 
     /// <summary>This peer's player id, or -1 before one is assigned.</summary>
-    public int LocalPlayerId => engine.LocalPlayerId;
+    public int LocalPlayerId => engine?.LocalPlayerId ?? -1;
 
-    /// <summary>Engine lifecycle state.</summary>
-    public KlothoState State => engine.State;
+    /// <summary>Engine lifecycle state. Idle while the handshake is pending.</summary>
+    public KlothoState State => engine?.State ?? (stopped ? KlothoState.Finished : KlothoState.Idle);
 
     /// <summary>Handshake / lobby / countdown progress.</summary>
-    public SessionPhase Phase => networkService.Phase;
+    public SessionPhase Phase => stopped || connectionFailure != null ? SessionPhase.Disconnected :
+        engine == null ? SessionPhase.Syncing : networkService.Phase;
 
     /// <summary>
     /// True once the server's authoritative world has been received and applied.
@@ -100,7 +106,7 @@ public sealed class FrifloKlothoClient : IDisposable
     /// ahead of the server on prediction, so its live state may still carry a guess the server has
     /// not confirmed — and may yet contradict.
     /// </remarks>
-    public int LastVerifiedTick => engine.LastVerifiedTick - 1;
+    public int LastVerifiedTick => engine == null ? -1 : engine.LastVerifiedTick - 1;
 
     /// <summary>
     /// How many times this client has had to rebuild its state from a server full state.
@@ -137,8 +143,8 @@ public sealed class FrifloKlothoClient : IDisposable
     /// <param name="store">The simulation store. Must be empty; the world arrives from the server.</param>
     /// <param name="transport">Transport to reach the server on.</param>
     /// <param name="simConfig">
-    /// Local defaults, superseded field by field once the server's authoritative configuration
-    /// arrives. Must be <see cref="NetworkMode.ServerDriven"/>.
+    /// Local connection defaults. Must be <see cref="NetworkMode.ServerDriven"/>. The engine and
+    /// snapshot ring are created from the server's authoritative configuration after the handshake.
     /// </param>
     /// <param name="sessionConfig">Local defaults; the authoritative values arrive with the server's GameStart.</param>
     /// <param name="callbacks">
@@ -177,15 +183,16 @@ public sealed class FrifloKlothoClient : IDisposable
                 $"for peer-to-peer play use {nameof(FrifloKlothoSession)}", nameof(simConfig));
         }
 
-        var client = new FrifloKlothoClient(store, simConfig, sessionConfig, callbacks, registerCommands, logger);
-        client.networkService.Initialize(transport, client.commandFactory, logger);
-        client.InitializeEngine();
-        // The room id travels as a RoomHandshakeMessage prefixed to the first message, which is how
-        // a RoomRouter decides where the peer belongs. A negative id leaves the service's _roomId at
-        // -1 and suppresses that prefix - correct for a single-room server, which has no router in
-        // front of it and would reject the prefix as a malformed first message.
-        client.networkService.JoinRoom(roomId >= 0 ? roomId.ToString(CultureInfo.InvariantCulture) : null);
-        client.networkService.Connect(address, port);
+        var client = new FrifloKlothoClient(store, sessionConfig, callbacks, registerCommands, logger);
+        client.connectingTransport = transport;
+        // Complete the configuration handshake before allocating any engine-owned buffers or the
+        // simulation's snapshot ring. The same connection helper serves KlothoSession.Create.
+        client.connection = KlothoConnection.Connect(
+            transport, address, port,
+            onCompleted: result => client.CompleteConnection(result, roomId),
+            onFailed: error => client.connectionFailure = error,
+            logger: logger,
+            preJoinMessage: roomId >= 0 ? new RoomHandshakeMessage { RoomId = roomId } : null);
         return client;
     }
 
@@ -199,8 +206,8 @@ public sealed class FrifloKlothoClient : IDisposable
     /// </param>
     /// <param name="store">The simulation store. Must be empty; the world arrives with the handshake.</param>
     /// <param name="simConfig">
-    /// Local defaults. The server's authoritative values arrived with the handshake and are applied
-    /// over these.
+    /// Local connection defaults. The server's authoritative configuration arrived with the
+    /// handshake and is used to construct the engine and snapshot ring.
     /// </param>
     /// <param name="sessionConfig">Local defaults; the authoritative values came with the accept message.</param>
     /// <param name="callbacks">
@@ -247,7 +254,11 @@ public sealed class FrifloKlothoClient : IDisposable
                 $"this entry point is for {JoinKind.LateJoin} and {JoinKind.Reconnect}", nameof(connection));
         }
 
-        var client = new FrifloKlothoClient(store, simConfig, sessionConfig, callbacks, registerCommands, logger);
+        if (connection.SimulationConfig == null || connection.SimulationConfig.Mode != NetworkMode.ServerDriven) {
+            throw new ArgumentException("the handshake must supply a server-driven simulation configuration", nameof(connection));
+        }
+        var client = new FrifloKlothoClient(store, sessionConfig, callbacks, registerCommands, logger);
+        client.CreateSimulation(connection.SimulationConfig);
 
         // Adopt the finished handshake rather than starting one: the service takes the player id,
         // session magic and clock offset from it, and moves straight to Synchronized. Calling
@@ -282,31 +293,51 @@ public sealed class FrifloKlothoClient : IDisposable
 
     private FrifloKlothoClient(
         EntityStore                store,
-        ISimulationConfig          simConfig,
         ISessionConfig             sessionConfig,
         IFrifloSimulationCallbacks callbacks,
         Action<CommandFactory>     registerCommands,
         IKLogger                   logger)
     {
-        this.callbacks = callbacks ?? throw new ArgumentNullException(nameof(callbacks));
-        this.logger    = logger;
+        this.store         = store;
+        this.sessionConfig = sessionConfig ?? throw new ArgumentNullException(nameof(sessionConfig));
+        this.callbacks     = callbacks ?? throw new ArgumentNullException(nameof(callbacks));
+        this.logger        = logger;
 
         commandFactory = new CommandFactory();
         registerCommands?.Invoke(commandFactory);
+        networkService = new ServerDrivenClientService();
+    }
 
+    private void CreateSimulation(ISimulationConfig simConfig)
+    {
         var systems = new SystemRoot(store);
         callbacks.RegisterSystems(systems, store);
-
         simulation = new FrifloSimulation(
-            store,
-            systems,
-            applyCommands:    ApplyCommands,
+            store, systems, applyCommands: ApplyCommands,
             rollbackCapacity: simConfig.GetSnapshotCapacity());
-
-        networkService = new ServerDrivenClientService();
-        engine         = new KlothoEngine(simConfig, sessionConfig);
-        sink           = new CommandSink(engine);
+        engine = new KlothoEngine(simConfig, sessionConfig);
+        sink = new CommandSink(engine);
     }
+
+    private void CompleteConnection(ConnectionResult result, int roomId)
+    {
+        if (stopped) {
+            return;
+        }
+        if (result.Kind != JoinKind.Normal || result.SimulationConfig.Mode != NetworkMode.ServerDriven) {
+            connectionFailure = new InvalidOperationException(
+                "Connect requires a normal server-driven handshake; use JoinRunningMatch for a running match");
+            return;
+        }
+        CreateSimulation(result.SimulationConfig);
+        networkService.InitializeFromConnection(result, commandFactory, logger, roomId);
+        InitializeEngine();
+        connectingTransport = null;
+        connection = null;
+    }
+
+    private InvalidOperationException EngineNotReady() => new InvalidOperationException(
+        "the client engine is unavailable until its configuration handshake completes", connectionFailure);
 
     /// <summary>Wire the engine to the simulation and the network, and take over input via <c>OnPreTick</c>.</summary>
     private void InitializeEngine()
@@ -392,7 +423,11 @@ public sealed class FrifloKlothoClient : IDisposable
     }
 
     /// <summary>Signal that this client is ready. The server starts the match once every player has.</summary>
-    public void SetReady(bool ready = true) => networkService.SetReady(ready);
+    public void SetReady(bool ready = true)
+    {
+        if (engine == null) throw EngineNotReady();
+        networkService.SetReady(ready);
+    }
 
     /// <summary>
     /// Supply somewhere to persist what a later reconnect needs: the server's address, the session
@@ -421,8 +456,14 @@ public sealed class FrifloKlothoClient : IDisposable
     public void SetReconnectCredentialsStore(
         IReconnectCredentialsStore store,
         string                     appVersion,
-        IDeviceIdProvider          deviceIdProvider = null) =>
+        IDeviceIdProvider          deviceIdProvider = null)
+    {
+        credentialsStore = store;
         networkService.SetReconnectCredentialsStore(store, appVersion, deviceIdProvider);
+        if (connection != null && !connection.IsCompleted) {
+            connection.SetDeviceIdProvider(deviceIdProvider);
+        }
+    }
 
     /// <summary>
     /// Advance one frame: pump the transport and the engine.
@@ -437,6 +478,13 @@ public sealed class FrifloKlothoClient : IDisposable
         if (stopped) {
             return;
         }
+        if (engine == null) {
+            connection?.Update();
+            if (connectionFailure != null) {
+                throw new InvalidOperationException("the server-driven connection handshake failed", connectionFailure);
+            }
+            return;
+        }
         engine.Update(deltaTime);
     }
 
@@ -447,6 +495,14 @@ public sealed class FrifloKlothoClient : IDisposable
             return;
         }
         stopped = true;
+        if (engine == null) {
+            connection?.Dispose();
+            connection = null;
+            connectingTransport?.Disconnect();
+            connectingTransport = null;
+            if (!keepReconnectCredentials) credentialsStore?.Clear();
+            return;
+        }
         engine.OnPreTick           -= HandlePreTick;
         engine.OnResyncCompleted   -= HandleStateApplied;
         engine.OnFrameVerified     -= HandleFrameVerified;

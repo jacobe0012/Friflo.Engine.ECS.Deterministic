@@ -31,6 +31,43 @@ public static class Test_ComponentContract
         public int    weight;
     }
 
+    private readonly struct ImmutableRef : IComponent
+    {
+        public readonly Entity other;
+        public readonly int    weight;
+        public ImmutableRef(Entity other, int weight) { this.other = other; this.weight = weight; }
+    }
+
+    private struct NestedImmutableRef : IComponent
+    {
+        public ImmutableRef inner;
+    }
+
+    /// <summary>Readonly fields are value state too; hash initialization must not try to assign them.</summary>
+    [Test]
+    public static void ReadonlyEntityFields_SurviveFullState()
+    {
+        var store = new EntityStore();
+        var target = store.CreateEntity();
+        var holder = store.CreateEntity(new ImmutableRef(target, 7),
+            new NestedImmutableRef { inner = new ImmutableRef(target, 11) });
+        var source = new FrifloSimulation(store, SampleSimulation.CreateSystems(store));
+        long before = source.GetStateHash();
+        var receiverStore = new EntityStore();
+        var receiver = new FrifloSimulation(receiverStore, SampleSimulation.CreateSystems(receiverStore));
+
+        receiver.RestoreFromFullState(source.SerializeFullState());
+
+        var restored = receiverStore.GetEntityById(holder.Id);
+        var direct = restored.GetComponent<ImmutableRef>();
+        var nested = restored.GetComponent<NestedImmutableRef>().inner;
+        Assert.AreEqual(receiverStore.GetEntityById(target.Id), direct.other);
+        Assert.AreEqual(7, direct.weight);
+        Assert.AreEqual(direct.other, nested.other);
+        Assert.AreEqual(11, nested.weight);
+        Assert.AreEqual(before, receiver.GetStateHash());
+    }
+
     /// <summary>A component holding a managed reference. Not reproducible across peers.</summary>
     private struct ClassRef : IComponent
     {
@@ -102,6 +139,25 @@ public static class Test_ComponentContract
         Assert.AreEqual(target.Id, restored.other.Id, "entity reference was not restored");
         Assert.AreEqual(3,         restored.weight);
         Assert.AreSame(store, restored.other.Store, "restored entity was not bound to the local store");
+    }
+
+    /// <summary>Null entity identity must preserve equality, not merely continue to report IsNull.</summary>
+    [Test]
+    public static void DefaultEntityField_SurvivesFullState()
+    {
+        var sourceStore = new EntityStore();
+        var holder = sourceStore.CreateEntity(new EntityRef { weight = 3 });
+        var source = new FrifloSimulation(sourceStore, SampleSimulation.CreateSystems(sourceStore));
+        var targetStore = new EntityStore();
+        var target = new FrifloSimulation(targetStore, SampleSimulation.CreateSystems(targetStore));
+
+        target.RestoreFromFullState(source.SerializeFullState());
+
+        var restored = targetStore.GetEntityById(holder.Id).GetComponent<EntityRef>();
+        Assert.AreEqual(default(Entity), restored.other,
+            "a missing target must still take the == default branch after a full state");
+        Assert.AreEqual(3, restored.weight);
+        Assert.AreEqual(source.GetStateHash(), target.GetStateHash());
     }
 
     /// <summary>A class-typed field must be rejected, naming the offending component.</summary>

@@ -57,6 +57,30 @@ public static class Test_AotFallbackPath
             "an AOT client and a JIT client would compute different hashes for the same state");
     }
 
+    /// <summary>ID recycling must not make AOT and JIT peers disagree when the short revision wraps.</summary>
+    [Test]
+    public static void RecycledEntityWithNegativeRevision_HasIdenticalLayouts()
+    {
+        var store = new EntityStore();
+        var entity = store.CreateEntity();
+        for (int i = 0; i <= short.MaxValue; i++) {
+            entity.DeleteEntity();
+            entity = store.CreateEntity();
+        }
+        Assert.AreEqual(short.MinValue, entity.Revision, "precondition: revision crossed its signed boundary");
+        var value = new Linked { target = entity, weight = -7, scale = FP64.Half };
+        var plan = DeterministicPlan.Get(typeof(Linked));
+
+        Assert.AreEqual(DeterministicLayout<Linked>.Hash(value), plan.HashObject(value),
+            "AOT and JIT disagree about the same recycled entity identity");
+        var compiled = new ulong[DeterministicLayout<Linked>.LeafCount];
+        var interpreted = new ulong[plan.Leaves.Length];
+        DeterministicLayout<Linked>.Write(value, compiled, 0);
+        plan.WriteObject(value, interpreted, 0);
+        CollectionAssert.AreEqual(compiled, interpreted,
+            "negative revisions must have the same FullState representation on both paths");
+    }
+
     /// <summary>The same must hold for a reference nested inside a struct field.</summary>
     [Test]
     public static void InterpretedHash_MatchesCompiledHash_Nested()

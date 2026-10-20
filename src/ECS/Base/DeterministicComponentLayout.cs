@@ -96,47 +96,54 @@ internal sealed class DeterministicPlan
         }
     }
 
-    // Suppressing IL2070 here silences the analyzer, it does not preserve anything: the fields must
-    // actually be rooted at the registration entry points, which annotate their type parameter with
-    // DynamicallyAccessedMembers (see NativeAOT.RegisterScript). Registering a type keeps the type,
-    // NOT its field metadata - a script whose fields ILC trimmed walks to zero leaves here, and the
-    // snapshot then captures and restores nothing at all, without ever throwing. Components reach
-    // this through DeterministicLayout<T>, whose T is statically known, so they root themselves.
+    // Metadata is rooted by NativeAOT's annotated registration entry points, not by these
+    // suppressions. Nested value types need their own registration: preserving an outer field
+    // does not preserve the members of its FieldType. Check every visited type before reflecting.
     [UnconditionalSuppressMessage("TrimAnalysis", "IL2070",
-        Justification = "Field metadata is preserved by the DynamicallyAccessedMembers annotations on the " +
-                        "registration entry points; component types arrive via the statically-known DeterministicLayout<T>.")]
+        Justification = "AOT types must be registered through annotated NativeAOT entry points.")]
+    [UnconditionalSuppressMessage("TrimAnalysis", "IL2075",
+        Justification = "RegisterScript preserves All, including private fields in its base classes.")]
     private static void Walk(Type type, List<FieldInfo> path, List<DeterministicLeaf> leaves, Type rootType)
     {
-        // Declaration order is stable for a given build, and writer and reader share this plan,
-        // so leaf order only has to be self-consistent.
-        var fields = type.GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-        foreach (var field in fields) {
-            var fieldType = field.FieldType;
-
-            if (fieldType == typeof(Entity)) {
-                // Contribute identity only; the store reference is process-local.
-                path.Add(field);
-                leaves.Add(new DeterministicLeaf { Path = path.ToArray(), Type = typeof(Entity), IsRevision = false });
-                leaves.Add(new DeterministicLeaf { Path = path.ToArray(), Type = typeof(Entity), IsRevision = true  });
-                path.RemoveAt(path.Count - 1);
-                continue;
-            }
-            if (fieldType.IsPrimitive || fieldType.IsEnum) {
-                path.Add(field);
-                leaves.Add(new DeterministicLeaf { Path = path.ToArray(), Type = fieldType });
-                path.RemoveAt(path.Count - 1);
-                continue;
-            }
-            if (fieldType.IsValueType) {
-                path.Add(field);
-                Walk(fieldType, path, leaves, rootType);
-                path.RemoveAt(path.Count - 1);
-                continue;
-            }
+        if (!RuntimeFeature.IsDynamicCodeSupported && !NativeAOT.IsDeterministicTypeRegistered(type)) {
+            string fieldPath = string.Join(".", path.ConvertAll(field => field.Name));
             throw new NotSupportedException(
-                $"'{rootType.Name}' has field '{field.Name}' of reference type '{fieldType.Name}', " +
-                 "so its state cannot be reproduced on another peer. Simulation components and scripts " +
-                 "must contain only value types (an Entity reference is allowed).");
+                $"deterministic field '{rootType.Name}.{fieldPath}' needs metadata for '{type.Name}'. " +
+                $"Call NativeAOT.RegisterDeterministicType<{type.Name}>() before CreateSchema().");
+        }
+        // GetFields on a derived type omits private base fields. Walk each declaration exactly
+        // once, derived-first, so a base script's private state is neither lost nor duplicated.
+        for (var current = type; current != null && current != typeof(object); current = current.BaseType) {
+            var fields = current.GetFields(BindingFlags.Instance | BindingFlags.Public |
+                                           BindingFlags.NonPublic | BindingFlags.DeclaredOnly);
+            foreach (var field in fields) {
+                var fieldType = field.FieldType;
+
+                if (fieldType == typeof(Entity)) {
+                    // Contribute identity only; the store reference is process-local.
+                    path.Add(field);
+                    leaves.Add(new DeterministicLeaf { Path = path.ToArray(), Type = typeof(Entity), IsRevision = false });
+                    leaves.Add(new DeterministicLeaf { Path = path.ToArray(), Type = typeof(Entity), IsRevision = true  });
+                    path.RemoveAt(path.Count - 1);
+                    continue;
+                }
+                if (fieldType.IsPrimitive || fieldType.IsEnum) {
+                    path.Add(field);
+                    leaves.Add(new DeterministicLeaf { Path = path.ToArray(), Type = fieldType });
+                    path.RemoveAt(path.Count - 1);
+                    continue;
+                }
+                if (fieldType.IsValueType) {
+                    path.Add(field);
+                    Walk(fieldType, path, leaves, rootType);
+                    path.RemoveAt(path.Count - 1);
+                    continue;
+                }
+                throw new NotSupportedException(
+                    $"'{rootType.Name}' has field '{field.Name}' of reference type '{fieldType.Name}', " +
+                     "so its state cannot be reproduced on another peer. Simulation components and scripts " +
+                     "must contain only value types (an Entity reference is allowed).");
+            }
         }
     }
 
@@ -170,7 +177,8 @@ internal sealed class DeterministicPlan
                 if (leaf.IsRevision) {
                     continue;   // consumed together with the id leaf
                 }
-                var entity = new Entity(store, (int)src[offset + i], (short)src[offset + i + 1]);
+                int id = (int)src[offset + i];
+                var entity = id == 0 ? default : new Entity(store, id, (short)src[offset + i + 1]);
                 SetNested(ref root, leaf.Path, entity);
                 continue;
             }
@@ -186,7 +194,7 @@ internal sealed class DeterministicPlan
         }
         if (leaf.Type == typeof(Entity)) {
             var entity = (Entity)value;
-            return leaf.IsRevision ? (ulong)(uint)entity.Revision : (ulong)(uint)entity.Id;
+            return leaf.IsRevision ? unchecked((ulong)(long)entity.Revision) : (ulong)(uint)entity.Id;
         }
         return ToUInt64(value, leaf.Type);
     }
@@ -314,6 +322,11 @@ internal static class DeterministicLayout<T> where T : struct
         }
         try {
             plan = DeterministicPlan.Get(typeof(T));
+            if (plan.Leaves.Length == 0) {
+                throw new NotSupportedException(
+                    $"no deterministic fields found for reference-bearing component '{typeof(T).Name}'. " +
+                     "Register it through NativeAOT before creating the schema so its field metadata is preserved.");
+            }
         }
         catch (NotSupportedException exception) {
             unsupported = exception;
@@ -324,7 +337,17 @@ internal static class DeterministicLayout<T> where T : struct
         if (RuntimeFeature.IsDynamicCodeSupported) {
             hash  = DeterministicLayoutBuilder.CompileHash<T>(plan.Leaves);
             write = DeterministicLayoutBuilder.CompileWrite<T>(plan.Leaves);
-            read  = DeterministicLayoutBuilder.CompileRead<T>(plan.Leaves);
+            // Expression.Assign rejects readonly fields (including readonly intermediate structs).
+            // Keep compiled reads for mutable layouts and use the existing interpreter otherwise.
+            bool canAssign = true;
+            foreach (var leaf in plan.Leaves) {
+                foreach (var field in leaf.Path) {
+                    if (field.IsInitOnly) canAssign = false;
+                }
+            }
+            if (canAssign) {
+                read = DeterministicLayoutBuilder.CompileRead<T>(plan.Leaves);
+            }
         }
     }
 
@@ -450,7 +473,9 @@ internal static class DeterministicLayoutBuilder
                 var revSlot  = Expression.ArrayIndex(src, Expression.Add(offset, Expression.Constant(i + 1)));
                 var id       = Expression.Convert(slot,    typeof(int));
                 var revision = Expression.Convert(revSlot, typeof(short));
-                body.Add(Expression.Assign(target, Expression.New(entityCtor!, store, id, revision)));
+                var entity = Expression.Condition(Expression.Equal(id, Expression.Constant(0)),
+                    Expression.Default(typeof(Entity)), Expression.New(entityCtor!, store, id, revision));
+                body.Add(Expression.Assign(target, entity));
                 continue;
             }
             body.Add(Expression.Assign(target, FromUInt64(slot, leaf.Type)));

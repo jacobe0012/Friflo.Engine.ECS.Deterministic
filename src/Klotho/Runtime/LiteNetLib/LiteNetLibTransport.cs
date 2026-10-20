@@ -17,6 +17,12 @@ namespace xpTURN.Klotho.LiteNetLib
     {
         IKLogger _logger;
         LiteNetManager _netManager;
+        // Serializes manager teardown. LiteNetManager.Stop() is check-then-act (if(!_isRunning) return;)
+        // with no internal lock, and the manager can be stopped from two threads at once (e.g. a server
+        // loop's Run() finally on its loop thread + a caller's Disconnect() on another). Without this
+        // lock the two stops interleave, one skips the thread-join, and the manager's native receive
+        // thread is orphaned (spins at high CPU forever).
+        readonly object _stopLock = new object();
         readonly LiteNetLibPeerMap _peerMap;
         bool _isConnected;
         int _localPeerId;
@@ -78,9 +84,38 @@ namespace xpTURN.Klotho.LiteNetLib
             _useIPv6 = IPv6Helper.IsIPv6(resolvedIp);
             _isServer = true;
             _localPeerId = 0;
-            _netManager = new LiteNetManager(this);
-            _netManager.IPv6Enabled = _useIPv6;
-            if (!_netManager.Start(port))
+            // Tear down any previous manager before binding. Listen() is a per-session entry point
+            // (KlothoSessionFlow.StartHostAndListen) and the session driver keeps one transport across
+            // sessions, so hosting a second time lands here with the first manager still running.
+            // Overwriting the field instead of stopping it left that manager's receive/logic threads
+            // and its bound socket with no reference that could ever stop them — the new Start(port)
+            // then failed with AddressAlreadyInUse, and every later attempt failed the same way.
+            // The stopped manager's peer registrations are dead too, so clear them for the new one.
+            //
+            // Stop() runs INSIDE the lock here — the one place that departs from the rule Connect()
+            // and Disconnect() follow. Two reasons it has to. The port is fixed, so the old socket
+            // must be released before the new bind, which rules out their start-new-then-stop-old
+            // order; and doing it in two lock regions would leave the field null in between, where a
+            // Disconnect() would see null, no-op, and be silently undone by the manager this call
+            // then installs. Affordable because Listen() is a session-lifecycle call, not a hot path.
+            // This holds only while events stay synced: turning UnsyncedEvents/UnsyncedReceiveEvent on
+            // would let the receive thread reach a handler that calls Disconnect(), which would then
+            // block on this lock while Stop() waits to join that same thread. Revisit it if that
+            // changes.
+            LiteNetManager manager;
+            lock (_stopLock)
+            {
+                _netManager?.Stop();
+                _peerMap.Clear();
+
+                // Publish only after a successful Start: the field must never hold a manager that is
+                // not running, or Broadcast/PollEvents would silently drive a dead one.
+                manager = new LiteNetManager(this);
+                manager.IPv6Enabled = _useIPv6;
+                _netManager = manager.Start(port) ? manager : null;
+            }
+
+            if (_netManager == null)
             {
                 _logger?.KError($"[LiteNetLibTransport] Server start failed — unable to bind port {port} (already in use?)");
                 return false;
@@ -101,36 +136,71 @@ namespace xpTURN.Klotho.LiteNetLib
             // interval while IsConnected stays false) leak threads/sockets and the abandoned
             // managers keep retransmitting Connection Requests in the background — the server
             // ends up accepting multiple sockets from the same client (zombie peers).
-            _netManager?.Stop();
-            // The stopped manager's peer registrations are dead. Clear them so a fresh connection to
-            // the same endpoint can re-register its peer id — otherwise a connection kept across a stop
-            // (no Disconnect) leaves a stale id and OnPeerConnected fails to register the new peer.
-            _peerMap.Clear();
-            _isConnected = false;
-            _netManager = new LiteNetManager(this);
-            _netManager.IPv6Enabled = _useIPv6;
-            if (!_netManager.Start())
+            //
+            // Capture-then-null under the same lock Disconnect() uses so this stop can't race a
+            // concurrent Disconnect() (which would double-Stop one manager and skip the thread-join).
+            // The stopped manager's peer registrations are dead, so clear them under the lock too: a
+            // fresh connection to the same endpoint must re-register its peer id — otherwise a
+            // connection kept across a stop (no Disconnect) leaves a stale id and OnPeerConnected fails
+            // to register the new peer.
+            //
+            // The replacement is built and STARTED under the same lock. Publishing an unstarted
+            // manager and starting it afterwards leaves a window where a concurrent Disconnect()
+            // takes the reference, finds _isRunning still false, no-ops, and nulls the field — then
+            // this call finishes Start() and the now-running manager is referenced by nobody and can
+            // never be stopped. Start() only binds a socket and creates threads (it joins nothing,
+            // and those threads never enter listener code), so holding the lock across it is safe.
+            LiteNetManager previous, fresh;
+            bool started;
+            lock (_stopLock)
+            {
+                previous = _netManager;
+                _peerMap.Clear();
+                _isConnected = false;
+
+                fresh = new LiteNetManager(this);
+                fresh.IPv6Enabled = _useIPv6;
+                started = fresh.Start();
+                _netManager = started ? fresh : null;
+            }
+            previous?.Stop();   // the join stays outside the lock
+
+            if (!started)
             {
                 _logger?.KError($"[LiteNetLibTransport] Client socket start failed");
                 return false;
             }
-            _netManager.Connect(resolvedIp, port, _connectionKey);
+            // Drive the local, not the field: a concurrent Disconnect() may have nulled it already,
+            // and re-reading is how the NRE above gets in.
+            fresh.Connect(resolvedIp, port, _connectionKey);
             _logger?.KTrace($"[LiteNetLibTransport] Connecting: {address}:{port}");
             return true;
         }
 
         public void Disconnect()
         {
-            bool wasConnected = _isConnected;
-            _netManager?.Stop();
-            _netManager = null;
-            _peerMap.Clear();
-            _isConnected = false;
+            // Capture-then-null the manager under the lock so exactly ONE caller owns the reference and
+            // drives Stop() to completion; a concurrent/repeat Disconnect sees mgr == null and no-ops.
+            // Stop() is called OUTSIDE the lock — it joins the receive/logic threads (CloseSocket), which
+            // must not block the lock (and the receive thread never re-enters Disconnect). This makes
+            // Disconnect idempotent and safe against the ServerLoop-thread vs caller-thread teardown race.
+            LiteNetManager mgr;
+            bool wasConnected;
+            lock (_stopLock)
+            {
+                mgr = _netManager;
+                _netManager = null;
+                wasConnected = _isConnected;
+                _isConnected = false;
+                _peerMap.Clear();
 
 #if KLOTHO_FAULT_INJECTION
-            _delayedRecvMessages.Clear();
-            _rttLogged = false;
+                _delayedRecvMessages.Clear();
+                _rttLogged = false;
 #endif
+            }
+
+            mgr?.Stop();
 
             if (!_isServer && wasConnected)
                 OnDisconnected?.Invoke(DisconnectReason.LocalDisconnect);
@@ -298,7 +368,21 @@ namespace xpTURN.Klotho.LiteNetLib
         {
             if (_isServer)
             {
-                if (_maxConnections > 0 && _netManager.ConnectedPeersCount >= _maxConnections)
+                // The only listener callback that reads _netManager, and callbacks dispatch on the
+                // PollEvents() thread — so a Disconnect() from another thread can null the field
+                // while this one is mid-dispatch. Capture once, and reject when it is gone: the
+                // request carries its own manager reference, so a null here decides the
+                // max-connections verdict only, and accepting would build a peer on a manager that
+                // is being thrown away.
+                var mgr = _netManager;
+                if (mgr == null)
+                {
+                    _logger?.KWarning($"[LiteNetLibTransport] Connection rejected: {request.RemoteEndPoint} — transport is shutting down");
+                    request.Reject();
+                    return;
+                }
+
+                if (_maxConnections > 0 && mgr.ConnectedPeersCount >= _maxConnections)
                 {
                     _logger?.KWarning($"[LiteNetLibTransport] Connection rejected: {request.RemoteEndPoint} — max connections ({_maxConnections}) reached");
                     request.Reject();

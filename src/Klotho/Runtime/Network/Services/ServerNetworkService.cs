@@ -888,7 +888,10 @@ namespace xpTURN.Klotho.Network
             _nextPlayerId = maxId + 1;
             _gameStarted = true;
 
-            _randomSeed = Environment.TickCount;
+            // Resolve the authored request at match start, matching the P2P host path.
+            _randomSeed = _sessionConfig.RandomSeed != 0
+                ? _sessionConfig.RandomSeed
+                : Environment.TickCount;
 
             bool useCountdown = _sessionConfig.CountdownDurationMs > 0;
 

@@ -1,11 +1,10 @@
 # Unity layout branch (`feat/unity-layout`)
 
 This branch exists so the repository can be dropped **inside a Unity project's `Assets/`** as a
-git submodule. It is `feat/klotho-integration` plus the mechanical changes that make Unity's
-importer behave.
-
-Nothing about the engine, the bridge or the determinism contract differs between the two
-branches. If you are not consuming this from Unity, use `feat/klotho-integration`.
+git submodule. It builds on `feat/klotho-integration` with the mechanical changes that make
+Unity's importer behave, plus the deterministic-state and connection fixes described below.
+The .NET projects remain buildable from this same tree; the branches are no longer identical
+in their bridge implementation.
 
 ## What Unity compiles
 
@@ -105,3 +104,64 @@ in Unity.
 `src/Klotho/Analyzers/KlothoGenerator.dll` is a netstandard2.0 Roslyn incremental generator.
 To make Unity run it, select the DLL in the Project window and tick the **RoslynAnalyzer**
 asset label. Unity will not execute it otherwise.
+
+## Deterministic state and NativeAOT registration
+
+FullState is now **version 5**. Script fields declared privately on base classes are included in
+rollback, hashing and FullState; older payloads are rejected before mutating the receiving store.
+Do not mix this build with v4 peers. Components may also hold readonly Entity fields, and a null
+Entity round-trips as `default(Entity)`, including its equality semantics.
+
+For NativeAOT, register each component, relation and script through its existing, most-specific
+`NativeAOT.Register...` method. These entry points preserve their own field metadata; script
+registration also preserves private base-class fields. **Nested value types need explicit metadata
+registration**, because retaining an outer field does not retain the members of its field type:
+
+```csharp
+aot.RegisterComponent<TargetState>();
+aot.RegisterScript<Cooldown>();
+aot.RegisterDeterministicType<FPVector3>(); // if a field contains an FPVector3
+aot.RegisterDeterministicType<FP64>();      // including the FP64 fields inside that vector
+aot.CreateSchema();
+```
+
+`RegisterDeterministicType<T>()` adds metadata only, not another component to the schema. Register
+every non-primitive, non-enum nested value type before `CreateSchema()`; Entity itself is a special
+case and needs no extra registration. Missing registration fails immediately with the field path
+and required call, instead of producing a partial hash or losing state. JIT builds discover fields
+normally and do not require these extra calls. These registrations apply to field-based layouts:
+scripts and components containing Entity references. Plain unmanaged components still use their raw
+value bytes. This does not relax the ban on other managed fields.
+
+The native smoke program is `src/Klotho/AotSmoke~/Klotho.AotSmoke.csproj`. Publish and run its native
+executable: a JIT/Mono smoke pass does not verify trimming or the AOT path. NativeAOT checks are not
+an IL2CPP Player certification.
+
+## Server-driven client initialization
+
+`FrifloKlothoClient.Connect()` completes the existing `KlothoConnection` handshake **before**
+constructing its engine and snapshot ring, so both use the server's authoritative configuration.
+Late join and reconnect also use the configuration carried by the completed connection result.
+
+While the handshake is pending, `Store`, `Phase`, `State`, `LocalPlayerId`, `LastVerifiedTick`,
+`Update()` and `Stop()` are usable. Wait for `Phase == SessionPhase.Synchronized` before accessing
+`Engine`, `Simulation`, `NetworkService` or calling `SetReady()`; those operations throw a clear
+`InvalidOperationException` if called too early. `HasWorld` still becomes true only once the
+server's FullState has been applied, not merely when the configuration handshake completes.
+
+## Completed-handshake receive ownership
+
+A completed `KlothoConnection` result now retains packets arriving before its session is created.
+This supports both construction inside `onCompleted` and construction after the handshake's
+`Update()` returns, including late join and cold-start reconnect. The adopting SD/P2P service
+replays pending receives in order on its first `Update()`, after engine initialization and world
+seeding; it does not execute them from `InitializeFromConnection()`.
+
+The handoff copies the valid packet bytes (transport buffers may be reused), is single-use, and
+is bounded to 1024 packets / 4 MiB. Overflow or a disconnect during handoff fails explicitly rather
+than proceeding with missing input. Normal delivery takes over after pending packets have drained.
+
+`KlothoConnection.Dispose()` detaches the handshake handlers but does not discard a successful
+result's pending receives. Adopt each result once, or call `ConnectionResult.Dispose()` if abandoning
+it. Disposing an already-adopted result does not cancel the service's receives. Neither operation
+closes the caller-owned transport; disconnect that transport explicitly when tearing down a peer.

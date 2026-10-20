@@ -323,8 +323,12 @@ namespace xpTURN.Klotho.Core
                     _tickCommandsCache.Add(predicted);
                     // On the SD path, prediction validation is replaced by the state hash, so _pendingCommands is not used.
 #if DEVELOPMENT_BUILD || UNITY_EDITOR
-                    var bufRange = _inputBuffer.GetBufferedTickRange(playerId);
-                    _logger?.KDebug($"[SD][PredSource] tick={CurrentTick} targetPlayerId={playerId} selfPeerId={LocalPlayerId} bufferedTickLo={bufRange.lo} bufferedTickHi={bufRange.hi}");
+                    // The string handler skips disabled Debug messages, but not this buffer scan.
+                    if (_logger != null && _logger.IsEnabled(KLogLevel.Debug))
+                    {
+                        var bufRange = _inputBuffer.GetBufferedTickRange(playerId);
+                        _logger.KDebug($"[SD][PredSource] tick={CurrentTick} targetPlayerId={playerId} selfPeerId={LocalPlayerId} bufferedTickLo={bufRange.lo} bufferedTickHi={bufRange.hi}");
+                    }
 #endif
                 }
             }

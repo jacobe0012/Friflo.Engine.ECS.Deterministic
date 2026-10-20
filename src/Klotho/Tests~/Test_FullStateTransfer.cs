@@ -1,4 +1,6 @@
+using System;
 using System.Collections.Generic;
+using System.IO;
 using Friflo.Engine.ECS;
 using Klotho.Friflo;
 using NUnit.Framework;
@@ -42,6 +44,47 @@ public static class Test_FullStateTransfer
     {
         public Entity leader;
         public int    distance;
+    }
+
+    /// <summary>A fresh receiver must support indexed mutation without first warming a lookup.</summary>
+    [Test]
+    public static void FreshStore_RebuildsIndexesBeforeDeletingTransferredEntities()
+    {
+        var sourceStore = new EntityStore();
+        var first = sourceStore.CreateEntity(new Team { id = 1 });
+        var second = sourceStore.CreateEntity(new Team { id = 2 });
+        var source = new FrifloSimulation(sourceStore, SampleSimulation.CreateSystems(sourceStore));
+        var receiverStore = new EntityStore();
+        var receiver = new FrifloSimulation(receiverStore, SampleSimulation.CreateSystems(receiverStore));
+
+        receiver.RestoreFromFullState(source.SerializeFullState());
+
+        // Reading ComponentIndex first would construct the missing table and hide the null path.
+        Assert.DoesNotThrow(() => receiverStore.GetEntityById(second.Id).DeleteEntity(),
+            "FullState restored indexed components but did not construct their derived index");
+        Assert.AreEqual(1, receiverStore.ComponentIndex<Team, int>()[1].Count);
+        Assert.AreEqual(first.Id, receiverStore.ComponentIndex<Team, int>()[1][0].Id);
+        Assert.AreEqual(0, receiverStore.ComponentIndex<Team, int>()[2].Count);
+    }
+
+    /// <summary>Older field layouts must be rejected before touching the receiving world.</summary>
+    [Test]
+    public static void VersionFourState_IsRejectedBeforeMutatingTheStore()
+    {
+        var source = SampleSimulation.Create();
+        NewEntity(source.Store);
+        byte[] data = source.SerializeFullState();
+        BitConverter.GetBytes(4).CopyTo(data, 0);
+        var receiver = SampleSimulation.Create();
+        var existing = NewEntity(receiver.Store);
+        long before = receiver.GetStateHash();
+
+        var error = Assert.Throws<InvalidDataException>(() => receiver.RestoreFromFullState(data));
+
+        StringAssert.Contains("unsupported state format 4", error.Message);
+        StringAssert.Contains("expected 5", error.Message);
+        Assert.AreEqual(before, receiver.GetStateHash(), "rejecting an old format changed the existing world");
+        Assert.IsFalse(existing.IsNull);
     }
 
     private static Entity NewEntity(EntityStore store) =>

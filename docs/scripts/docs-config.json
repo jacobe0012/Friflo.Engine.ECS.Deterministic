@@ -1,5 +1,5 @@
 {
-  "AssemblyFilePath": "../../src/ECS/bin/Release/net8.0/Friflo.Engine.ECS.dll",
+  "AssemblyFilePath": "../../src/ECS/.bin/Friflo.Engine.ECS/Release/net8.0/Friflo.Engine.ECS.dll",
   "OutputDirectoryPath": "../../../Friflo.Engine-docs/api",
   "GeneratedAccessModifiers": "Public,Protected,ProtectedInternal",
   "IncludeUndocumentedItems": true,

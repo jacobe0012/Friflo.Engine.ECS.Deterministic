@@ -29,13 +29,13 @@ probe was outside the physics step: the SD client never registered the static gr
 ## Run
 
 ```sh
-cd Tools/PhysicsDeterminismProbe
+cd src/Klotho/Tools~/PhysicsDeterminismProbe
 dotnet build -f net8.0  -c Release
 dotnet build -f net472  -c Release   # needs System.Memory (restored automatically)
 
 MONO="/Applications/Unity/Hub/Editor/6000.3.9f1/Unity.app/Contents/Resources/Scripting/MonoBleedingEdge/bin/mono"
-dotnet bin/Release/net8.0/PhysicsDeterminismProbe.dll out_coreclr.txt
-"$MONO"     bin/Release/net472/PhysicsDeterminismProbe.exe out_mono.txt
+dotnet .bin/PhysicsDeterminismProbe/Release/net8.0/PhysicsDeterminismProbe.dll out_coreclr.txt
+"$MONO" .bin/PhysicsDeterminismProbe/Release/net472/PhysicsDeterminismProbe.exe out_mono.txt
 
 diff <(grep -v '^#' out_coreclr.txt) <(grep -v '^#' out_mono.txt) \
   && echo "IDENTICAL (deterministic)" || echo "DIVERGENCE — investigate"
